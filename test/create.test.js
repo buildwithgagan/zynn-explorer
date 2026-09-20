@@ -315,7 +315,8 @@ test("sample data respects foreign keys, uniqueness, checks and enums, and is re
   const data = make();
   assert.deepEqual(data, make());
   const col = (id, name) => data[id].rows.map((r) => r[data[id].columns.indexOf(name)]);
-  assert.ok(!data["public.orders"].columns.includes("id") && !data["public.orders"].columns.includes("created_at"));
+  // Identity keys are left to Postgres. created_at is not: left to its default, every row would be stamped with the insert.
+  assert.ok(!data["public.orders"].columns.includes("id") && data["public.orders"].columns.includes("created_at"));
   assert.ok(col("public.orders", "customer_id").every((v) => v >= 1 && v <= 30));
   assert.equal(new Set(col("public.customers", "email")).size, 30);
   assert.ok(col("public.customers", "email").every((v) => v === v.toLowerCase()));
@@ -493,4 +494,59 @@ test("a view is a table's columns plus yes/no columns or a row test, and may use
   assert.equal(gone.statements[0].sql, 'DROP VIEW "public"."sessions_live";');
   assert.equal(fingerprint(build(gone.inverse, gone.draft).draft), fingerprint(r.draft));
   assert.equal(fingerprint(build(r.inverse, r.draft).draft), fingerprint(base));
+});
+
+test("sample rows are coherent: time runs forwards, events follow status, numbers agree", () => {
+  const NOW = Date.UTC(2026, 8, 21);
+  const design = build([
+    { kind: "create_enum", name: "sub_status", values: ["trialing", "active", "past_due", "cancelled"] },
+    { kind: "create_enum", name: "inv_status", values: ["draft", "open", "paid", "void"] },
+    { kind: "create_enum", name: "user_status", values: ["pending", "active"] },
+    table("users", [{ name: "email", type: T("text"), archetype: "email" }, { name: "status", type: { enum: "public.user_status" }, nullable: false }, { name: "email_verified_at", type: T("timestamptz") }, { name: "last_login_at", type: T("timestamptz") }, { name: "failed_login_count", type: T("integer") }]),
+    table("sessions", [{ name: "user_id", ref: { table: "public.users", onDelete: "cascade" }, nullable: false }, { name: "expires_at", type: T("timestamptz"), nullable: false }, { name: "revoked_at", type: T("timestamptz") }]),
+    table("plans", [{ name: "monthly_price", type: T("numeric", 12, 2), archetype: "money" }, { name: "yearly_price", type: T("numeric", 12, 2), archetype: "money" }, { name: "min_seats", type: T("integer") }, { name: "max_seats", type: T("integer") }]),
+    table("subscriptions", [{ name: "user_id", ref: { table: "public.users" }, nullable: false }, { name: "status", type: { enum: "public.sub_status" }, nullable: false }, { name: "started_at", type: T("timestamptz") }, { name: "current_period_end", type: T("timestamptz") }, { name: "cancelled_at", type: T("timestamptz") }]),
+    table("invoices", [{ name: "subscription_id", ref: { table: "public.subscriptions" }, nullable: false }, { name: "status", type: { enum: "public.inv_status" }, nullable: false }, { name: "due_date", type: T("date") }, { name: "paid_at", type: T("timestamptz") }]),
+    table("order_lines", [{ name: "quantity", type: T("integer"), archetype: "quantity", check: "positive" }, { name: "unit_price", type: T("numeric", 12, 2), archetype: "money" }, { name: "line_total", type: T("numeric", 12, 2), archetype: "money" }]),
+  ]).draft;
+  const make = () => {
+    const rng = mulberry32(9), keys = {}, moments = {}, out = {};
+    for (const id of topoTables(design).order) {
+      const d = generateRows(design, id, 60, rng, keys, { now: NOW, parentMoments: moments });
+      keys[id] = d.rows.map((_, i) => i + 1);
+      moments[id] = new Map(d.moments.map((m, i) => [String(i + 1), m]));
+      out[id] = d.rows.map((r) => Object.fromEntries(d.columns.map((c, i) => [c, r[i]])));
+    }
+    return { out, moments };
+  };
+  const { out, moments } = make();
+  assert.deepEqual(make().out, out, "the same seed and the same day give the same rows");
+  const t = (v) => new Date(v).getTime();
+
+  for (const s of out["public.sessions"]) {
+    assert.ok(t(s.expires_at) > t(s.created_at), "a session expires after it was created");
+    assert.ok(t(s.created_at) >= moments["public.users"].get(String(s.user_id)), "and was created after its user");
+    assert.ok(t(s.created_at) <= NOW && t(s.updated_at) >= t(s.created_at) && t(s.updated_at) <= NOW);
+    if (s.revoked_at) assert.ok(t(s.revoked_at) > t(s.created_at) && t(s.revoked_at) <= NOW);
+  }
+  const live = out["public.sessions"].filter((s) => t(s.expires_at) > NOW).length, revoked = out["public.sessions"].filter((s) => s.revoked_at).length;
+  assert.ok(live > 10 && live < 60, `some sessions are live and some have expired (${live} of 60 live)`);
+  assert.ok(revoked < 20, `revoking is rare (${revoked} of 60)`);
+
+  for (const s of out["public.subscriptions"]) {
+    assert.equal(Boolean(s.cancelled_at), s.status === "cancelled", "cancelled_at is set exactly when the status says cancelled");
+    if (s.started_at && s.current_period_end) assert.ok(t(s.current_period_end) > t(s.started_at));
+    if (s.started_at) assert.ok(t(s.started_at) >= t(s.created_at));
+  }
+  for (const i of out["public.invoices"]) {
+    assert.equal(Boolean(i.paid_at), i.status === "paid", "paid_at is set exactly when the invoice is paid");
+    assert.match(i.due_date ?? "2026-01-01", /^\d{4}-\d{2}-\d{2}$/);
+  }
+  for (const u of out["public.users"]) if (u.status === "pending") assert.equal(u.email_verified_at, null, "a pending user has not verified their email");
+  assert.ok(out["public.users"].filter((u) => u.failed_login_count === 0).length > 35, "most users have no failed logins");
+  for (const p of out["public.plans"]) {
+    assert.equal(Number(p.yearly_price), Number((Number(p.monthly_price) * 10).toFixed(2)), "a year costs ten months");
+    assert.ok(Number(p.monthly_price) <= 500 && p.max_seats >= p.min_seats);
+  }
+  for (const l of out["public.order_lines"]) assert.equal(Number(l.line_total), Number((l.quantity * Number(l.unit_price)).toFixed(2)), "a line total is quantity times unit price");
 });
