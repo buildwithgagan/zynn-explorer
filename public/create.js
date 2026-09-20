@@ -214,7 +214,7 @@ export function createPage(params, status, { onSchemaChanged, onDatabaseCreated 
   const list = h("div.chat-thread");
   const scroller = h("div.chat-scroll", list);
   const chips = h("div.suggestions", { "aria-label": "Suggestions" });
-  const input = h("textarea.composer-input", { rows: 1, maxLength: 600, placeholder: "Describe what to build or change…", "aria-label": "Your request", disabled: !status.jev });
+  const input = h("textarea.composer-input", { rows: 1, maxLength: 900, placeholder: "Describe what to build or change…", "aria-label": "Your request", disabled: !status.jev });
   const send = h("button.send", { type: "submit", title: "Send", "aria-label": "Send", disabled: true }, lineIcon(SEND_ICON, 18));
   const autosize = () => { input.style.height = "auto"; input.style.height = Math.min(input.scrollHeight, 160) + "px"; };
   const sync = () => { send.disabled = busy || !input.value.trim() || !status.jev; };
@@ -225,6 +225,11 @@ export function createPage(params, status, { onSchemaChanged, onDatabaseCreated 
     if (turn.error) return h("div.answer", errorBox(turn.error));
     if (!d) return h("div.answer.thinking", h("span.dots", h("i"), h("i"), h("i")), "Reading your request");
     const parts = [h("p.say", d.reply?.text)];
+    // Several changes in one message: one line each, so a part that was not understood is as visible as the rest.
+    if (d.reply?.parts?.length) {
+      parts.push(h("ol.change-list", d.reply.parts.map((p) => h(`li${p.ok ? "" : ".failed"}`,
+        h("span.change-said", p.request), h("span.change-result", p.text), (p.notes ?? []).map((n) => h("span.change-note", n))))));
+    }
     for (const n of d.reply?.notes ?? []) parts.push(h("div.note", n));
     if (d.clarify?.length) parts.push(h("div.chips", d.clarify.map((q) => h("button.chip-btn", { type: "button", onclick: () => { input.value = q; autosize(); sync(); input.focus(); } }, q))));
     if (d.askInstead) parts.push(h("div.toolbar", h("a.btn.small", { href: `#/ask?q=${enc(d.askInstead)}` }, "Ask this instead")));

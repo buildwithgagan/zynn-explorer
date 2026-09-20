@@ -9,7 +9,7 @@ import { generateRows } from "../server/create/seed.js";
 import { mulberry32, inferArchetype } from "../server/create/archetypes.js";
 import { parseCatalogType, parseCatalogDefault, parseCatalogGenerated, isSafeWidening, cleanDefault } from "../server/create/types.js";
 import { describeOp, summarizeOps } from "../server/create/wording.js";
-import { identCandidates, tableIdent, toSnake, singularize, valueLists } from "../server/nl/candidates.js";
+import { identCandidates, tableIdent, toSnake, singularize, valueLists, splitChanges } from "../server/nl/candidates.js";
 
 const T = (base, ...args) => (args.length ? { base, args } : { base });
 const table = (name, columns, extra = {}) => ({ kind: "create_table", name, columns, ...extra });
@@ -442,4 +442,22 @@ test("the schema exports as SQL that names everything, and migrations as numbere
   // The checksum is the byte sum of the header with the checksum field read as spaces.
   const head = archive.slice(0, 512), stored = parseInt(text.slice(148, 154), 8);
   assert.equal(head.reduce((a, b, i) => a + (i >= 148 && i < 156 ? 32 : b), 0), stored);
+});
+
+test("a message is split into changes at command verbs, never inside a list, a bracket or a description", () => {
+  assert.deepEqual(splitChanges("make phone required on owners, rename practitioners to vets and drop notes from appointments"),
+    ["make phone required on owners", "rename practitioners to vets", "drop notes from appointments"]);
+  assert.deepEqual(splitChanges("add a phone number to customers and make it required"), ["add a phone number to customers", "make it required"]);
+  assert.deepEqual(splitChanges("fill every table with 25 sample rows then create a read-only role called analyst"), ["fill every table with 25 sample rows", "create a read-only role called analyst"]);
+  // A sentence that is not a command describes the create/add before it, and stays with it.
+  const sessions = "create a table called sessions with token hash, ip address and expires at. each session belongs to a user. when a user is deleted their sessions are deleted too";
+  assert.deepEqual(splitChanges(sessions), [sessions]);
+  assert.deepEqual(splitChanges("create a table called invoices with number, amount and status (draft, sent, paid). number must be unique and required. index invoices by due date"),
+    ["create a table called invoices with number, amount and status (draft, sent, paid). number must be unique and required", "index invoices by due date"]);
+  // …but after any other kind of request it is a change of its own.
+  assert.deepEqual(splitChanges("rename practitioners to vets. the phone on owners should be required"), ["rename practitioners to vets", "the phone on owners should be required"]);
+  // Field lists, privilege lists, quotes and brackets are never split.
+  for (const whole of ["add a loyalty points field and a birthday to customers", "let the zynn_api role read, add and edit users, sessions and subscriptions",
+    'add a tier to plans: "premium, and make it big" when monthly price is over 50, otherwise "standard"', "create a table called tasks with title and priority (low, and make it high)"]) assert.deepEqual(splitChanges(whole), [whole]);
+  assert.equal(splitChanges(Array.from({ length: 9 }, (_, i) => `drop table t${i}`).join(". ")).length, 6);
 });

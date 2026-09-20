@@ -289,3 +289,39 @@ export function valueLists(request) {
   }
   return out;
 }
+
+// ---------------------------------------------------------------------------
+// Several changes in one message. Where one change ends and the next begins is a matter of punctuation and
+// command verbs, so code finds it. Each piece is then read on its own, in order.
+// ---------------------------------------------------------------------------
+const COMMAND = "make|rename|drop|remove|delete|add|change|create|index|set|let|give|grant|revoke|fill|seed|turn|build|design|allow|stop|link|connect|call|convert|default|export|review";
+const COMMAND_START = new RegExp(`^(?:please\\s+|also\\s+|then\\s+|and\\s+|now\\s+|next\\s+|finally\\s+|lastly\\s+)*(?:${COMMAND})\\b`, "i");
+// A request that creates or adds something goes on to describe it: its fields, what it belongs to, what happens on delete.
+const DESCRIBES = /^(?:please\s+|also\s+|then\s+|and\s+|now\s+)*(?:create|add|build|design)\b/i;
+
+/**
+ * "make phone required on owners, rename practitioners to vets and drop notes from appointments" → three requests.
+ * A comma or "and" only splits when a command verb follows, so field lists stay whole. A sentence that is not a
+ * command stays with the create/add request before it, which it describes ("… each session belongs to a user.").
+ */
+export function splitChanges(request, max = 6) {
+  // Brackets and quotes never contain a boundary.
+  const held = [];
+  const masked = String(request).replace(/\([^()]*\)|"[^"]*"|'[^']*'|“[^”]*”/g, (m) => `§§${held.push(m) - 1}§§`);
+  const restore = (s) => s.replace(/§§(\d+)§§/g, (_, i) => held[Number(i)]);
+  const pieces = masked
+    .split(/(?<=[.!?;])\s+|\n+|\s+(?:and\s+)?then\s+(?=\S)/i)
+    // An access sentence lists verbs of its own ("read, add and edit users"), and a verb followed by "and" or a comma is
+    // part of such a list, not the start of a new request.
+    .flatMap((sentence) => (/^(?:please\s+|also\s+|and\s+)*(?:let|allow|grant|give|revoke|stop)\b/i.test(sentence.trim()) ? [sentence]
+      : sentence.split(new RegExp(`\\s*(?:,\\s*(?:and\\s+)?(?:also\\s+)?|\\s+and\\s+(?:also\\s+)?|\\s+also\\s+)(?=(?:${COMMAND})\\b(?!\\s*(?:,|and\\b|or\\b)))`, "i"))))
+    .map((p) => restore(p).trim().replace(/^(?:and|also|then)\s+/i, "").replace(/[.;,]+$/, "").trim())
+    .filter((p) => p.length > 2);
+  const out = [];
+  for (const piece of pieces) {
+    const standsAlone = COMMAND_START.test(piece) || !out.length || !DESCRIBES.test(out.at(-1));
+    if (standsAlone) out.push(piece);
+    else out[out.length - 1] += `. ${piece}`;
+  }
+  return out.length > max ? [...out.slice(0, max - 1), out.slice(max - 1).join(". ")] : out;
+}

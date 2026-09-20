@@ -65,6 +65,12 @@ const CASES = [
   // Changing and removing a combination rule. The third item stages a rule first; the whole draft is compared.
   ["reviews should be unique per product, customer and rating instead", /^add_unique:reviews\(product_id,customer_id,rating\)$/, [{ id: "rule", kind: "add_unique", table: "public.reviews", columns: ["product_id", "customer_id"] }]],
   ["a customer no longer needs to be limited to one review per product, remove that rule", /^$/, [{ id: "rule", kind: "add_unique", table: "public.reviews", columns: ["product_id", "customer_id"] }]],
+  // Several changes in one message.
+  ["make the sku on products optional, rename categories to collections and index orders by placed at", /^drop_not_null:products\.sku rename_table:categories>collections add_index:orders\(placed_at\)$/],
+  ["add a nickname to customers and make it required", /^add_column:customers\.nickname!$/],
+  ["the phone on customers must be unique and required", /^(set_not_null:customers\.phone add_unique:customers\(phone\)|add_unique:customers\(phone\) set_not_null:customers\.phone)$/],
+  ["create a table called notes with body. each note belongs to a customer. index notes by created at", /^create_table:notes add_index:notes\(created_at\)$/],
+  ["rename categories to collections. what's the weather like", /^rename_table:categories>collections$/], // one part fails, the other still stages
   ["export the schema as sql", null],
   ["review my schema", null],
   ["how many orders were placed last month", null],
@@ -78,7 +84,7 @@ const sig = (o) => {
   const t = (id) => String(id ?? "").split(".").pop();
   switch (o.kind) {
     case "create_table": return `create_table:${o.name}${o.columns.some((c) => !c.ref) && ["invoices", "tickets", "members", "gym_classes"].includes(o.name) ? `[${o.columns.map((c) => c.name)}]` : ""}`;
-    case "add_column": return `add_column:${t(o.table)}.${o.column.name}`;
+    case "add_column": return `add_column:${t(o.table)}.${o.column.name}${o.column.nullable === false && /nickname/.test(o.column.name) ? "!" : ""}`;
     case "rename_column": return `rename_column:${t(o.table)}.${o.column}>${o.name}`;
     case "rename_table": return `rename_table:${t(o.table)}>${o.name}`;
     case "add_index": return `add_index:${t(o.table)}(${o.columns})`;

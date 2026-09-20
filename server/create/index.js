@@ -7,6 +7,7 @@ import { checkNewIdent, OpError } from "./validate.js";
 import { advise as runAdvisor } from "./advisor.js";
 import { apply as runApply } from "./apply.js";
 import { interpret as understand } from "./understand.js";
+import { splitChanges } from "../nl/candidates.js";
 import { describeOp, CONVENTIONS } from "./wording.js";
 import { BLUEPRINTS } from "./blueprints/index.js";
 import { TYPES } from "./types.js";
@@ -54,13 +55,10 @@ export async function compile(body) {
   return (await view(body?.ops)).payload;
 }
 
-export async function interpret(body) {
-  const request = String(body?.request ?? "").trim();
-  if (!request) throw fail(400, "Say what you want to build or change");
-  if (request.length > 600) throw fail(400, "Keep the request under 600 characters");
-  const started = performance.now();
-  const before = await view(body?.ops);
-  const read = await understand(request, before.baseline, before.compiled.draft, before.compiled.ops);
+/** Read one request against the draft as it stands, and report honestly what the compiler then made of it. */
+async function interpretOne(request, rawOps, focus) {
+  const before = await view(rawOps);
+  const read = await understand(request, before.baseline, before.compiled.draft, before.compiled.ops, focus);
   const after = read.ok ? (await view(read.ops)).payload : before.payload;
   // An op the compiler refuses is reported, not silently dropped.
   const refused = after.broken.filter((b) => read.added?.includes(b.id));
@@ -70,12 +68,52 @@ export async function interpret(body) {
     reply.text = `I understood that, but it cannot be staged: ${refused[0].reason}.`;
     reply.notes = refused.slice(1).map((b) => `${b.reason}.`);
   } else if (refused.length) reply.notes = [...(reply.notes ?? []), ...refused.map((b) => `I could not stage part of that: ${b.reason}.`)];
+  const draft = { ...after, ops: after.ops.filter((o) => !refused.some((b) => b.id === o.id)) };
+  return { read, reply, draft, ok: read.ok && (read.added.length === 0 || refused.length < read.added.length) };
+}
+
+export async function interpret(body) {
+  const request = String(body?.request ?? "").trim();
+  if (!request) throw fail(400, "Say what you want to build or change");
+  if (request.length > 900) throw fail(400, "Keep the request under 900 characters");
+  const started = performance.now();
+  // A message may hold several changes. Each is read in turn against the draft the previous one left, so
+  // "create …, then index it" works, and what one was about carries to the next ("… and make it required").
+  const pieces = splitChanges(request);
+  let ops = body?.ops, focus = {}, last = null;
+  const parts = [], usage = { requests: 0, input_tokens: 0, output_tokens: 0 };
+  for (const [i, piece] of pieces.entries()) {
+    const one = await interpretOne(piece, ops, focus);
+    last = one;
+    ops = one.draft.ops;
+    if (one.ok && one.read.subject?.table) focus = one.read.subject;
+    for (const k of Object.keys(usage)) usage[k] += one.read.usage?.[k] ?? 0;
+    parts.push({
+      request: piece, ok: one.ok, text: one.reply.text, notes: one.reply.notes ?? [], added: one.read.added ?? [],
+      suggestions: one.read.suggestions ?? [], clarify: one.read.clarify, askInstead: one.read.askInstead, pendingDatabase: one.read.pendingDatabase, focus: one.read.focus,
+      judgments: (one.read.judgments ?? []).map((j) => (pieces.length > 1 ? { ...j, key: `${i}:${j.key}`, group: piece } : j)),
+    });
+  }
+  const common = {
+    added: parts.flatMap((p) => p.added), suggestions: parts.flatMap((p) => p.suggestions).slice(0, 6), judgments: parts.flatMap((p) => p.judgments),
+    pendingDatabase: parts.find((p) => p.pendingDatabase)?.pendingDatabase, askInstead: parts.find((p) => p.askInstead)?.askInstead,
+    focus: parts.findLast((p) => p.focus)?.focus, usage, model: last.read.model, ms: Math.round(performance.now() - started), draft: last.draft,
+  };
+  if (parts.length === 1) return { ok: parts[0].ok, reply: { text: parts[0].text, notes: parts[0].notes }, clarify: parts[0].clarify, ...common };
+
+  // Several changes: one line each, so a part that was not understood is as visible as the parts that were.
+  const done = parts.filter((p) => p.ok).length;
+  const strip = (t) => t.replace(/\s*Nothing has touched the database yet\. Review it on the right, then press Apply\.$/, "");
   return {
-    ok: read.ok && (read.added.length === 0 || refused.length < read.added.length), reply,
-    added: read.added, suggestions: (read.suggestions ?? []).slice(0, 6), clarify: read.clarify, askInstead: read.askInstead,
-    pendingDatabase: read.pendingDatabase, focus: read.focus, judgments: read.judgments,
-    usage: read.usage, model: read.model, ms: Math.round(performance.now() - started),
-    draft: { ...after, ops: after.ops.filter((o) => !refused.some((b) => b.id === o.id)) },
+    ok: done > 0,
+    reply: {
+      text: done === parts.length ? `I took that as ${parts.length} changes and staged all of them. Nothing has touched the database yet. Review them on the right, then press Apply.`
+        : done ? `I took that as ${parts.length} changes. ${done} ${done === 1 ? "is" : "are"} staged; ${parts.length - done} I could not do, and nothing of ${parts.length - done === 1 ? "it" : "them"} was applied. Nothing has touched the database yet.`
+        : `I took that as ${parts.length} changes, and could not do any of them.`,
+      parts: parts.map((p) => ({ request: p.request, ok: p.ok, text: strip(p.text), notes: p.notes })),
+      notes: [],
+    },
+    ...common,
   };
 }
 

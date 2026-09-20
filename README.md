@@ -212,6 +212,16 @@ numbered `.sql` file per migration applied from this page, each wrapped in a tra
 but not reproduced. The schema file is the source of truth: it also covers changes made outside Create, which the
 migrations cannot know about. Nothing in either file is executed by the app.
 
+**Several changes in one message.** "Make the sku on products optional, rename categories to collections and index
+orders by placed at" is three changes. Where one ends and the next begins is punctuation and command verbs, so code
+splits the message: at sentence ends, "then", and a comma or "and" followed by a command verb (make, rename, drop, add,
+index, …), never inside a field list, a privilege list ("read, add and edit"), quotes or brackets. A sentence that is
+not a command stays with the create/add request it describes ("… each session belongs to a user."). Each change is then
+read in order against the draft the previous one left, and what it was about carries forward, so "add a seat limit to
+plans and default it to 5" knows what "it" is and becomes one `ADD COLUMN … DEFAULT 5`. The reply lists every change
+with its own result, so one that was not understood is as visible as the ones that were; the others still stage. One
+clause can also ask two things of a column ("must be unique and required").
+
 **Nothing dropped silently.** When a request builds or extends a table, any phrase that ended up with no role at all is
 named at the end of the reply ("I didn't use "whatever marketing wants" …"), so a field that was not understood is
 visible instead of quietly missing. A field named once for several new tables ("members have a name … each class has a
@@ -306,7 +316,8 @@ unique, not unique, type, rename, remove), and removing a draft table also remov
 ### Limits
 
 Jev selects; it cannot invent. A name must appear in your message or in a blueprint, so "a table for the
-things people buy" gets a question back, not a guess. One kind of change per message. Domains outside the
+things people buy" gets a question back, not a guess. Up to six changes per message, each costing its own
+Jev requests (about 0.4 s and 6k tokens apiece). Domains outside the
 ten blueprints start as plain named tables for you to fill in. Sample data is plausible, not realistic,
 and triggers or hand-written checks on existing tables can reject it (the trial run says which). Not
 covered: views, functions, triggers, partitioning, composite foreign keys, converting existing data to an enum, calculations with more than two columns, several conditions at once, or anything that depends on the
@@ -314,7 +325,7 @@ current time, and defaults other than a number, true/false, now, today, a time f
 JSON object, an allowed value or quoted text. For those, **Open in SQL editor**. Identity columns need Postgres 10+, `gen_random_uuid()` 13+.
 
 To re-check Jev's readings after changing a question or threshold, connect the app to a scratch database
-with the online-store blueprint applied and run `node scripts/creator-regression.mjs` (56 requests × 3,
+with the online-store blueprint applied and run `node scripts/creator-regression.mjs` (61 requests × 3,
 reports flips). `node scripts/creator-ask.mjs "…"` prints how one request was read. `node scripts/creator-blueprints-live.mjs` dry-runs every blueprint plus sample data.
 
 ## Layout
