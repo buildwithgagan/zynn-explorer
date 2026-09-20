@@ -110,6 +110,50 @@ function addIndex(design, table, columns, unique, out, why) {
 const numberSql = (n) => (n < 0 ? `(${String(Number(n))})` : String(Number(n)));
 const constantSql = (c) => (c.text != null ? quoteLiteral(c.text) : numberSql(c.number));
 
+/**
+ * SQL for one test on a column, with the columns it reads. `clock` allows comparing with now() / CURRENT_DATE, which only
+ * something evaluated when it is read (a view) may do; a stored calculated column may not.
+ */
+function conditionSql(d, t, k, { clock = false, input = (name) => getColumn(t, name) } = {}) {
+  const test = k && Object.hasOwn(TESTS, k.test ?? "") ? TESTS[k.test] : null;
+  if (!test) throw new OpError("That condition is not one Creator can write");
+  const a = input(k.column);
+  const reads = [a.name];
+  let right = null;
+  if (!test.unary) {
+    const v = k.value;
+    if (!v) throw new OpError("The condition needs something to compare with");
+    const ordered = isNumericBase(a.type.base) || ["date", "timestamp", "timestamptz", "interval"].includes(a.type.base);
+    if (test.ordered && !ordered) throw new OpError(`"${test.words}" needs a number or a date, and ${a.name} is ${typeLabel(a.type)}`);
+    if (v.clock != null) {
+      if (!clock) throw new OpError("A stored calculated column cannot depend on now or today. A view can");
+      if (!["date", "timestamp", "timestamptz"].includes(a.type.base)) throw new OpError(`${a.name} is ${typeLabel(a.type)}, which cannot be compared with ${v.clock}`);
+      right = a.type.base === "date" ? "CURRENT_DATE" : "now()";
+    } else if (v.column != null) {
+      const b = input(v.column);
+      if (!sameType(a.type, b.type) && !(isNumericBase(a.type.base) && isNumericBase(b.type.base))) throw new OpError(`${a.name} (${typeLabel(a.type)}) and ${b.name} (${typeLabel(b.type)}) cannot be compared`);
+      if (b.name === a.name) throw new OpError("A column cannot be compared with itself");
+      reads.push(b.name);
+      right = quoteIdent(b.name);
+    } else if (v.label != null) {
+      const e = a.type.enum && d.enums[a.type.enum];
+      if (!e?.values.includes(v.label)) throw new OpError(`"${v.label}" is not one of the values ${a.name} can hold`);
+      if (test.ordered) throw new OpError("An allowed value can only be tested with is / is not");
+      right = `${quoteLiteral(v.label)}::${qualified(e.schema, e.name)}`;
+    } else if (v.bool != null) {
+      if (a.type.base !== "boolean" || test.ordered) throw new OpError(`${a.name} is not a yes/no column`);
+      right = v.bool ? "true" : "false";
+    } else if (v.number != null) {
+      if (!isNumericBase(a.type.base)) throw new OpError(`${a.name} is ${typeLabel(a.type)}, which cannot be compared with a number`);
+      right = numberSql(v.number);
+    } else if (v.text != null) {
+      if (!isTextBase(a.type.base) || test.ordered) throw new OpError(`${a.name} is ${typeLabel(a.type)}, which cannot be compared with that text`);
+      right = quoteLiteral(v.text);
+    } else throw new OpError("The condition needs something to compare with");
+  }
+  return { sql: test.sql(quoteIdent(a.name), right), reads };
+}
+
 /** The expression, result type and input columns of a calculated column. Built from templates, quoted names and literals only. */
 function generatedExpression(d, t, op) {
   const input = (name) => {
@@ -118,40 +162,7 @@ function generatedExpression(d, t, op) {
     return c;
   };
   if (op.template === "when") {
-    const k = op.condition;
-    const test = k && Object.hasOwn(TESTS, k.test ?? "") ? TESTS[k.test] : null;
-    if (!test) throw new OpError("That condition is not one Creator can write");
-    const a = input(k.column);
-    const reads = [a.name];
-    let right = null;
-    if (!test.unary) {
-      const v = k.value;
-      if (!v) throw new OpError("The condition needs something to compare with");
-      const ordered = isNumericBase(a.type.base) || ["date", "timestamp", "timestamptz", "interval"].includes(a.type.base);
-      if (test.ordered && !ordered) throw new OpError(`"${test.words}" needs a number or a date, and ${a.name} is ${typeLabel(a.type)}`);
-      if (v.column != null) {
-        const b = input(v.column);
-        if (!sameType(a.type, b.type) && !(isNumericBase(a.type.base) && isNumericBase(b.type.base))) throw new OpError(`${a.name} (${typeLabel(a.type)}) and ${b.name} (${typeLabel(b.type)}) cannot be compared`);
-        if (b.name === a.name) throw new OpError("A column cannot be compared with itself");
-        reads.push(b.name);
-        right = quoteIdent(b.name);
-      } else if (v.label != null) {
-        const e = a.type.enum && d.enums[a.type.enum];
-        if (!e?.values.includes(v.label)) throw new OpError(`"${v.label}" is not one of the values ${a.name} can hold`);
-        if (test.ordered) throw new OpError("An allowed value can only be tested with is / is not");
-        right = `${quoteLiteral(v.label)}::${qualified(e.schema, e.name)}`;
-      } else if (v.bool != null) {
-        if (a.type.base !== "boolean" || test.ordered) throw new OpError(`${a.name} is not a yes/no column`);
-        right = v.bool ? "true" : "false";
-      } else if (v.number != null) {
-        if (!isNumericBase(a.type.base)) throw new OpError(`${a.name} is ${typeLabel(a.type)}, which cannot be compared with a number`);
-        right = numberSql(v.number);
-      } else if (v.text != null) {
-        if (!isTextBase(a.type.base) || test.ordered) throw new OpError(`${a.name} is ${typeLabel(a.type)}, which cannot be compared with that text`);
-        right = quoteLiteral(v.text);
-      } else throw new OpError("The condition needs something to compare with");
-    }
-    const condition = test.sql(quoteIdent(a.name), right);
+    const { sql: condition, reads } = conditionSql(d, t, op.condition, { input });
     if (!op.then) {
       if (op.else) throw new OpError("An otherwise-value needs a value for when the condition holds");
       return { sql: condition, type: { base: "boolean" }, reads };
@@ -261,6 +272,7 @@ const STEPS = {
     t.name = op.name;
     d.tables[newId] = t;
     for (const other of Object.values(d.tables)) for (const f of other.fks) if (f.refTable === op.table) f.refTable = newId;
+    for (const v of Object.values(d.views ?? {})) { if (v.reads?.[op.table]) { v.reads[newId] = v.reads[op.table]; delete v.reads[op.table]; } if (v.spec?.table === op.table) v.spec.table = newId; }
     ctx.renames[newId] = ctx.renames[op.table] ?? op.table;
     delete ctx.renames[op.table];
     return [{ kind: "rename_table", table: newId, name: oldName }];
@@ -268,6 +280,8 @@ const STEPS = {
 
   drop_table(d, op, out) {
     const t = getTable(d, op.table);
+    const readers = Object.values(d.views ?? {}).filter((v) => Object.hasOwn(v.reads ?? {}, op.table));
+    if (readers.length) throw new OpError(`The view${readers.length === 1 ? "" : "s"} ${readers.map((v) => v.name).join(", ")} read${readers.length === 1 ? "s" : ""} ${t.name}. Drop ${readers.length === 1 ? "it" : "them"} first`);
     const users = Object.values(d.tables).filter((o) => o !== t && o.fks.some((f) => f.refTable === op.table));
     if (users.length) throw new OpError(`${users.map((u) => u.name).join(", ")} still reference${users.length === 1 ? "s" : ""} ${t.name}. Remove that relation, or drop ${users.length === 1 ? "that table" : "those tables"} first`);
     delete d.tables[op.table];
@@ -324,6 +338,8 @@ const STEPS = {
     if (t.pk?.columns.includes(op.column)) throw new OpError(`"${op.column}" is part of ${t.name}'s primary key`);
     const users = Object.values(d.tables).filter((o) => o.fks.some((f) => f.refTable === op.table && f.refColumns.includes(op.column)));
     if (users.length) throw new OpError(`${users.map((u) => u.name).join(", ")} reference${users.length === 1 ? "s" : ""} ${t.name}.${op.column}`);
+    const showing = Object.values(d.views ?? {}).filter((v) => v.reads?.[op.table]?.includes(op.column));
+    if (showing.length) throw new OpError(`The view${showing.length === 1 ? "" : "s"} ${showing.map((v) => v.name).join(", ")} show${showing.length === 1 ? "s" : ""} ${t.name}.${op.column}. Drop ${showing.length === 1 ? "it" : "them"} first`);
     const computed = t.columns.filter((c) => c.generatedAs?.columns.includes(op.column));
     if (computed.length) throw new OpError(`${computed.map((c) => c.name).join(", ")} ${computed.length === 1 ? "is" : "are"} calculated from ${op.column}. Drop ${computed.length === 1 ? "that column" : "those"} first`);
     if (t.columns.length === 1) throw new OpError(`"${op.column}" is ${t.name}'s only column. Drop the table instead`);
@@ -357,6 +373,8 @@ const STEPS = {
     if (sameType(c.type, op.type)) throw new OpError(`${t.name}.${c.name} is already ${typeLabel(c.type)}`);
     const linked = t.fks.some((f) => f.columns.includes(c.name)) || Object.values(d.tables).some((o) => o.fks.some((f) => f.refTable === op.table && f.refColumns.includes(c.name)));
     if (linked) throw new OpError(`${t.name}.${c.name} is part of a foreign key. Both sides must keep the same type`);
+    const viewing = Object.values(d.views ?? {}).filter((v) => v.reads?.[op.table]?.includes(c.name));
+    if (viewing.length) throw new OpError(`The view ${viewing[0].name} shows ${t.name}.${c.name}, and Postgres will not retype a column a view uses. Drop the view first`);
     if (t.columns.some((g) => g.generatedAs?.columns.includes(c.name))) throw new OpError(`${t.columns.find((g) => g.generatedAs?.columns.includes(c.name)).name} is calculated from ${c.name}. Drop that column first`);
     if (c.identity && !["smallint", "integer", "bigint"].includes(op.type.base)) throw new OpError("An identity column must stay a whole-number type");
     const safe = isSafeWidening(c.type, op.type);
@@ -515,6 +533,40 @@ const STEPS = {
     t.indexes = t.indexes.filter((x) => x !== i);
     out.push({ sql: `DROP INDEX ${qualified(t.schema, i.name)};`, level: "caution", reason: "Queries that relied on it get slower" });
     return i.definition && !i.columns.length ? null : [{ kind: "add_index", table: op.table, columns: i.columns, unique: i.unique }];
+  },
+
+  create_view(d, op, out) {
+    d.views ??= {};
+    const t = getTable(d, op.table);
+    const schema = op.schema ?? t.schema;
+    checkNewIdent(op.name, "view name");
+    if (!d.schemas.includes(schema)) throw new OpError(`Schema ${schema} does not exist`);
+    if (relationNames(d, schema).has(op.name)) throw new OpError(`${schema} already has something named ${op.name}`);
+    if (!op.flags.length && !op.filter) throw new OpError("A view needs a yes/no column or a test that picks its rows");
+    const taken = new Set(t.columns.map((c) => c.name));
+    const extra = op.flags.map((f) => {
+      checkNewIdent(f.name, "column name");
+      if (taken.has(f.name)) throw new OpError(`${t.name} already has a column "${f.name}"`);
+      taken.add(f.name);
+      return `  (${conditionSql(d, t, f.condition, { clock: true }).sql}) AS ${quoteIdent(f.name)}`;
+    });
+    const where = op.filter ? `\nWHERE ${conditionSql(d, t, op.filter, { clock: true }).sql}` : "";
+    const id = `${schema}.${op.name}`;
+    // The view lists every column of its table, so every one of them is something it depends on.
+    d.views[id] = { schema, name: op.name, spec: { table: op.table, flags: op.flags, filter: op.filter ?? null }, reads: { [op.table]: t.columns.map((c) => c.name) } };
+    out.push({
+      sql: `CREATE VIEW ${qualified(schema, op.name)} AS\nSELECT\n${[...t.columns.map((c) => `  ${quoteIdent(c.name)}`), ...extra].join(",\n")}\nFROM ${tableSql(t)}${where};`,
+      level: "safe", reason: "Worked out each time it is read, so it is always current. It stores nothing",
+    });
+    return [{ kind: "drop_view", view: id }];
+  },
+
+  drop_view(d, op, out) {
+    const v = Object.hasOwn(d.views ?? {}, op.view ?? "") ? d.views[op.view] : null;
+    if (!v) throw new OpError(`The view ${String(op.view).slice(0, 80)} does not exist at this point in the draft`);
+    delete d.views[op.view];
+    out.push({ sql: `DROP VIEW ${qualified(v.schema, v.name)};`, level: "caution", reason: "Anything that queries the view stops working. No data is lost" });
+    return v.spec ? [{ kind: "create_view", schema: v.schema, name: v.name, table: v.spec.table, flags: v.spec.flags, filter: v.spec.filter ?? undefined }] : null;
   },
 
   create_enum(d, op, out) {

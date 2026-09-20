@@ -42,6 +42,13 @@ export function describeOp(op) {
       if (op.constant) return `Add ${op.name} to ${t}, always ${op.constantFirst ? `${say(op.constant)} ${GENERATED[op.template]?.symbol} ${op.columns[0]}` : `${op.columns[0]} ${GENERATED[op.template]?.symbol} ${say(op.constant)}`}`;
       return describeCalculated(op, t);
     }
+    case "create_view": {
+      const v = (c) => (!c.value ? "" : ` ${c.value.clock ?? c.value.column ?? c.value.label?.replace(/_/g, " ") ?? (c.value.bool != null ? (c.value.bool ? "yes" : "no") : c.value.text != null ? `"${c.value.text}"` : c.value.number)}`);
+      const when = (c) => `${c.column} ${TESTS[c.test]?.words ?? "?"}${v(c)}`;
+      const flags = op.flags.map((f) => `${f.name} (yes when ${when(f.condition)})`);
+      return `Create view ${op.name}: ${t}${op.filter ? ` where ${when(op.filter)}` : ""}${flags.length ? `, with ${list(flags)}` : ""}`;
+    }
+    case "drop_view": return `Drop view ${tableName(op.view)}`;
     case "drop_column": return `Drop ${t}.${op.column}`;
     case "rename_column": return `Rename ${t}.${op.column} to ${op.name}`;
     case "alter_column_type": return `Change ${t}.${op.column} to ${typeLabel(op.type)}`;

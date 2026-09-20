@@ -21,7 +21,7 @@ export async function loadDesign() {
   const key = JSON.stringify(connectionInfo());
   if (cache && cache.key === key && Date.now() - cache.at < TTL_MS) return structuredClone(cache.design);
 
-  const [meta, schemas, tables, columns, constraints, indexes, enums, policies, grants, roles] = await Promise.all([
+  const [meta, schemas, tables, columns, constraints, indexes, enums, policies, grants, roles, views] = await Promise.all([
     rows(`select current_database() as database, current_setting('server_version_num')::int as version_num`),
     rows(`select n.nspname as name from pg_namespace n where ${USER_SCHEMA} order by 1`),
     rows(`select c.oid::int as oid, n.nspname as schema, c.relname as name, c.reltuples::bigint as est_rows,
@@ -74,11 +74,22 @@ export async function loadDesign() {
           from information_schema.role_table_grants
           where table_schema not in ('pg_catalog','information_schema') group by 1, 2 order by 1, 2`),
     rows(`select rolname as name, rolcanlogin as login from pg_roles where rolname !~ '^pg_' order by 1`),
+    // Views, with the table columns each one reads: those cannot be dropped or retyped while the view exists.
+    rows(`select n.nspname as schema, c.relname as name, pg_get_viewdef(c.oid, true) as definition,
+                 coalesce((select json_agg(json_build_object('table', tn.nspname || '.' || tc.relname, 'column', a.attname))
+                           from pg_rewrite r
+                           join pg_depend dp on dp.objid = r.oid and dp.classid = 'pg_rewrite'::regclass
+                                            and dp.refclassid = 'pg_class'::regclass and dp.refobjsubid > 0
+                           join pg_class tc on tc.oid = dp.refobjid join pg_namespace tn on tn.oid = tc.relnamespace
+                           join pg_attribute a on a.attrelid = dp.refobjid and a.attnum = dp.refobjsubid
+                           where r.ev_class = c.oid and tc.oid <> c.oid), '[]'::json) as reads
+          from pg_class c join pg_namespace n on n.oid = c.relnamespace
+          where c.relkind = 'v' and ${USER_SCHEMA} order by 1, 2`),
   ]);
 
   const design = {
     database: meta[0].database, versionNum: meta[0].version_num,
-    schemas: schemas.map((s) => s.name), enums: {}, roles: {}, tables: {},
+    schemas: schemas.map((s) => s.name), enums: {}, roles: {}, tables: {}, views: {},
   };
   for (const e of enums) design.enums[`${e.schema}.${e.name}`] = { schema: e.schema, name: e.name, values: e.values };
   for (const r of roles) design.roles[r.name] = { login: r.login };
@@ -123,6 +134,12 @@ export async function loadDesign() {
   for (const p of policies) byOid.get(p.rel)?.policies.push({ name: p.name, command: POLICY_CMDS[p.command] ?? "all", roles: p.roles, using: p.using, check: p.with_check });
   for (const g of grants) design.tables[g.table_id]?.grants.push({ role: g.role, privileges: g.privileges });
 
+  for (const v of views) {
+    const reads = {};
+    for (const r of v.reads) (reads[r.table] ??= []).push(r.column);
+    design.views[`${v.schema}.${v.name}`] = { schema: v.schema, name: v.name, definition: v.definition, reads };
+  }
+
   cache = { key, at: Date.now(), design };
   return structuredClone(design);
 }
@@ -136,7 +153,7 @@ const canonical = (v) => {
 /** Identifies a schema state. Apply refuses to run against a database that has moved on since the preview. */
 export function fingerprint(design) {
   const tables = Object.fromEntries(Object.entries(design.tables).map(([id, t]) => [id, { ...t, estRows: undefined, grants: undefined }]));
-  return createHash("sha1").update(JSON.stringify(canonical({ tables, enums: design.enums }))).digest("hex");
+  return createHash("sha1").update(JSON.stringify(canonical({ tables, enums: design.enums, views: Object.fromEntries(Object.entries(design.views ?? {}).map(([id, v]) => [id, Object.keys(v.reads ?? {}).sort()])) }))).digest("hex");
 }
 
 /** Tables ordered so that every table comes after the tables it references. Edges that close a cycle are `deferred`. */
@@ -189,5 +206,5 @@ export function toErd(baseline, draft, renames = {}) {
 }
 
 export function emptyDesign(database = "draft") {
-  return { database, versionNum: 160000, schemas: ["public"], enums: {}, roles: {}, tables: {} };
+  return { database, versionNum: 160000, schemas: ["public"], enums: {}, roles: {}, tables: {}, views: {} };
 }

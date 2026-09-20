@@ -25,6 +25,19 @@ function cleanColumn(raw) {
   return col;
 }
 
+/** A test on a column. `clock` (now / today) is only accepted by things evaluated when read, which the compiler enforces. */
+function cleanCondition(raw) {
+  if (!raw || typeof raw !== "object") return undefined;
+  const v = raw.value;
+  return {
+    column: str(raw.column), test: oneOf(raw.test, Object.keys(TESTS), undefined),
+    value: v == null ? undefined : typeof v === "object" && v.column != null ? { column: str(v.column) }
+      : typeof v === "object" && v.clock != null ? { clock: oneOf(v.clock, ["now", "today"], "now") }
+      : typeof v === "object" && v.label != null ? { label: str(v.label, 63) }
+      : typeof v === "object" && v.bool != null ? { bool: Boolean(v.bool) } : cleanConstant(v),
+  };
+}
+
 const SHAPES = {
   create_schema: (r) => ({ name: str(r.name, 80) }),
   create_table: (r) => ({
@@ -44,12 +57,7 @@ const SHAPES = {
   add_generated_column: (r) => ({
     table: str(r.table), name: str(r.name, 80), template: oneOf(r.template, [...Object.keys(GENERATED), "when"], undefined), columns: strList(r.columns, 2),
     constant: cleanConstant(r.constant), constantFirst: r.constantFirst ? true : undefined,
-    condition: r.condition && typeof r.condition === "object" ? {
-      column: str(r.condition.column), test: oneOf(r.condition.test, Object.keys(TESTS), undefined),
-      value: r.condition.value == null ? undefined : typeof r.condition.value === "object" && r.condition.value.column != null ? { column: str(r.condition.value.column) }
-        : typeof r.condition.value === "object" && r.condition.value.label != null ? { label: str(r.condition.value.label, 63) }
-        : typeof r.condition.value === "object" && r.condition.value.bool != null ? { bool: Boolean(r.condition.value.bool) } : cleanConstant(r.condition.value),
-    } : undefined,
+    condition: cleanCondition(r.condition),
     then: cleanConstant(r.then), else: cleanConstant(r.else),
   }),
   drop_column: (r) => ({ table: str(r.table), column: str(r.column) }),
@@ -71,6 +79,13 @@ const SHAPES = {
   drop_constraint: (r) => ({ table: str(r.table), name: str(r.name) }),
   add_index: (r) => ({ table: str(r.table), columns: strList(r.columns, 8), unique: bool(r.unique, false) }),
   drop_index: (r) => ({ table: str(r.table), name: str(r.name) }),
+  // A view is one table's columns plus yes/no columns from conditions, or only the rows that pass one. Never a query text.
+  create_view: (r) => ({
+    schema: str(r.schema, 80), name: str(r.name, 80), table: str(r.table),
+    flags: (Array.isArray(r.flags) ? r.flags : []).slice(0, 6).map((f) => ({ name: str(f?.name, 80), condition: cleanCondition(f?.condition) })),
+    filter: cleanCondition(r.filter),
+  }),
+  drop_view: (r) => ({ view: str(r.view) }),
   create_enum: (r) => ({ schema: str(r.schema, 80) ?? "public", name: str(r.name, 80), values: strList(r.values, 100).map((v) => v.slice(0, 63)) }),
   add_enum_value: (r) => ({ enum: str(r.enum), value: str(r.value, 63) }),
   drop_enum: (r) => ({ enum: str(r.enum) }),

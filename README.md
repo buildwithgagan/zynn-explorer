@@ -303,6 +303,17 @@ and a zero divisor gives an empty value rather than an error that would block th
 same answer every time, so a condition on today or now ("is overdue", "is expired") is refused with that explanation
 and pointed at Ask instead of being frozen into the table.
 
+**Views.** "Create a view of sessions with an is expired flag that is true when expires at is before now", "create a
+view called active subscriptions showing subscriptions where status is active", "a view of overdue invoices: invoices
+where due date is before today". A view is one table's columns plus a yes/no column from a test, or only the rows that
+pass one: a template, like everything else, never query text. It uses the same tests as calculated columns with one
+difference: a view is worked out each time it is read, so it may compare with **now** and **today**, which a stored
+column may not. Asking for a clock-dependent calculated column is still refused, and the refusal now offers the view as
+a one-click suggestion. Words such as "expired", "overdue" and "upcoming" are a comparison with the clock by rule. A view
+or flag you do not name gets a name by rule, and the reply says so. What a view shows cannot be dropped or retyped
+from under it (views found in the database included, via their catalog dependencies), "drop the … view" removes one,
+and views are part of `schema.sql`.
+
 **Changing a combination rule.** On a table that already has one, "memberships should be unique per organization,
 user and role instead" replaces it (drop and add in the same transaction), and "… no longer needs to be unique, remove
 that rule" drops it; Jev is asked which rule and, column by column, what the combination is afterwards. A rule still
@@ -320,12 +331,12 @@ things people buy" gets a question back, not a guess. Up to six changes per mess
 Jev requests (about 0.4 s and 6k tokens apiece). Domains outside the
 ten blueprints start as plain named tables for you to fill in. Sample data is plausible, not realistic,
 and triggers or hand-written checks on existing tables can reject it (the trial run says which). Not
-covered: views, functions, triggers, partitioning, composite foreign keys, converting existing data to an enum, calculations with more than two columns, several conditions at once, or anything that depends on the
-current time, and defaults other than a number, true/false, now, today, a time from now, a UUID, an empty
+covered: views over more than one table or with several tests, functions, triggers, partitioning, composite foreign keys, converting existing data to an enum, calculations with more than two columns, several conditions at once (a stored column that
+depends on the current time is refused by design: that is what a view is for), and defaults other than a number, true/false, now, today, a time from now, a UUID, an empty
 JSON object, an allowed value or quoted text. For those, **Open in SQL editor**. Identity columns need Postgres 10+, `gen_random_uuid()` 13+.
 
 To re-check Jev's readings after changing a question or threshold, connect the app to a scratch database
-with the online-store blueprint applied and run `node scripts/creator-regression.mjs` (61 requests × 3,
+with the online-store blueprint applied and run `node scripts/creator-regression.mjs` (66 requests × 3,
 reports flips). `node scripts/creator-ask.mjs "…"` prints how one request was read. `node scripts/creator-blueprints-live.mjs` dry-runs every blueprint plus sample data.
 
 ## Layout

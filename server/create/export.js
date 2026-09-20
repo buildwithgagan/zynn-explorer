@@ -69,6 +69,7 @@ export function schemaSql(design, { at = new Date() } = {}) {
     for (const c of t.columns) if (c.comment) out.push(`COMMENT ON COLUMN ${target}.${quoteIdent(c.name)} IS ${quoteLiteral(c.comment)};\n`);
   }
   out.push(...tail);
+  for (const v of Object.values(design.views ?? {})) if (v.definition) out.push(`CREATE VIEW ${qualified(v.schema, v.name)} AS\n${v.definition.trim().replace(/;$/, "")};\n`);
 
   const access = [];
   const roles = new Set();

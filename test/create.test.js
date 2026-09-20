@@ -461,3 +461,36 @@ test("a message is split into changes at command verbs, never inside a list, a b
     'add a tier to plans: "premium, and make it big" when monthly price is over 50, otherwise "standard"', "create a table called tasks with title and priority (low, and make it high)"]) assert.deepEqual(splitChanges(whole), [whole]);
   assert.equal(splitChanges(Array.from({ length: 9 }, (_, i) => `drop table t${i}`).join(". ")).length, 6);
 });
+
+test("a view is a table's columns plus yes/no columns or a row test, and may use now and today", () => {
+  const base = build([{ kind: "create_enum", name: "sub_status", values: ["trialing", "active"] },
+    table("sessions", [{ name: "token", type: T("text") }, { name: "expires_at", type: T("timestamptz"), nullable: false }, { name: "due", type: T("date") }, { name: "status", type: { enum: "public.sub_status" } }])]).draft;
+  const view = (rest) => ({ kind: "create_view", table: "public.sessions", ...rest });
+  const expired = { column: "expires_at", test: "lt", value: { clock: "now" } };
+  const r = build([view({ name: "sessions_live", flags: [{ name: "is_expired", condition: expired }] })], base);
+  assert.deepEqual(r.broken, []);
+  assert.equal(r.statements[0].sql, 'CREATE VIEW "public"."sessions_live" AS\nSELECT\n  "id",\n  "token",\n  "expires_at",\n  "due",\n  "status",\n  "created_at",\n  "updated_at",\n  ("expires_at" < now()) AS "is_expired"\nFROM "public"."sessions";');
+  assert.equal(r.level, "safe");
+  const filtered = build([view({ name: "active_sessions", filter: { column: "status", test: "eq", value: { label: "active" } }, flags: [{ name: "is_overdue", condition: { column: "due", test: "lt", value: { clock: "today" } } }] })], base);
+  assert.match(filtered.statements[0].sql, /\("due" < CURRENT_DATE\) AS "is_overdue"\nFROM "public"\."sessions"\nWHERE "status" = 'active'::"public"\."sub_status";$/);
+  assert.equal(describeOp(cleanOp(view({ name: "sessions_live", flags: [{ name: "is_expired", condition: expired }] }))), "Create view sessions_live: sessions, with is_expired (yes when expires_at is less than now)");
+
+  // The clock is for views only: a stored calculated column still refuses it.
+  assert.match(build([{ kind: "add_generated_column", table: "public.sessions", name: "x", template: "when", condition: expired }], base).broken[0].reason, /cannot depend on now or today\. A view can/);
+  const why = (rest) => build([view(rest)], base).broken[0]?.reason;
+  assert.match(why({ name: "v" }), /needs a yes\/no column or a test/);
+  assert.match(why({ name: "sessions", filter: expired }), /already has something named sessions/);
+  assert.match(why({ name: "v", flags: [{ name: "token", condition: expired }] }), /already has a column "token"/);
+  assert.match(why({ name: "v", filter: { column: "token", test: "lt", value: { clock: "now" } } }), /needs a number or a date/);
+  assert.match(why({ name: 'v"; drop table sessions; --', filter: expired }), /not a valid view name/);
+  assert.equal(cleanOp(view({ name: "v", filter: { column: "due", test: "lt", value: { clock: "now()); drop table x; --" } } })).filter.value.clock, "now");
+
+  // What a view shows cannot be dropped or retyped from under it, and undo puts the view back.
+  assert.match(build([{ kind: "drop_column", table: "public.sessions", column: "token" }], r.draft).broken[0].reason, /view sessions_live shows sessions\.token/);
+  assert.match(build([{ kind: "drop_table", table: "public.sessions" }], r.draft).broken[0].reason, /view sessions_live reads sessions/);
+  assert.match(build([{ kind: "alter_column_type", table: "public.sessions", column: "token", type: T("varchar", 10) }], r.draft).broken[0].reason, /will not retype a column a view uses/);
+  const gone = build([{ kind: "drop_view", view: "public.sessions_live" }], r.draft);
+  assert.equal(gone.statements[0].sql, 'DROP VIEW "public"."sessions_live";');
+  assert.equal(fingerprint(build(gone.inverse, gone.draft).draft), fingerprint(r.draft));
+  assert.equal(fingerprint(build(r.inverse, r.draft).draft), fingerprint(base));
+});

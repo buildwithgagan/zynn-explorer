@@ -35,6 +35,8 @@ const OPS = {
   remove_thing: "Delete an existing table or column. Examples: 'drop the legacy table', 'remove the fax column from contacts', 'get rid of notes'.",
   relate_tables: "Create a new link between two tables that exist but are not linked yet: one belongs to the other, or they are many-to-many. Examples: 'orders belong to customers', 'each post has one author', 'posts can have many tags'.",
   computed_column: "Add a column whose value is always calculated from other columns of the same row (optionally with a fixed number or a condition), so it never has to be filled in. Examples: 'add a line total to order items that is quantity times unit price', 'full name should be first name plus last name', 'add a duration that is ends at minus starts at', 'add a lowercase version of email called email lower', 'add a gross price that is price times 1.2', 'add an is large flag that is true when quantity is over 100', 'shipping fee is 0 when total is over 50, otherwise 5'.",
+  create_view: "Create a view: a saved way of looking at one table, worked out fresh every time it is read. It shows the table's rows with an extra yes/no column from a test, or only the rows that pass a test. The test may compare with now or today. Examples: 'create a view of sessions with an is expired flag that is true when expires at is before now', 'create a view called active subscriptions showing subscriptions where status is active', 'a view of overdue invoices: invoices where due date is before today'.",
+  drop_view: "Delete a view. Examples: 'drop the active subscriptions view', 'remove the view sessions live'.",
   unique_together: "Several columns of one table must be unique in combination: a row may repeat each value, but not the same combination. Examples: 'one membership per user per organization', 'provider and provider user id together must be unique', 'plan names must be unique within a product', 'a user can review a product only once'. Also changing or removing such a rule: 'memberships should be unique per organization, user and role instead', 'plan names no longer need to be unique within a product'.",
   on_delete: "Change what happens to linked rows when the row they belong to is deleted: delete them too, keep them and clear the link, or block the deletion. Examples: 'when a user is deleted keep their audit events', 'deleting a customer should delete their orders too', 'do not allow deleting a plan that has subscriptions'.",
   add_index: "Add an index to make lookups faster. Examples: 'index orders by created_at', 'add an index on email'.",
@@ -698,6 +700,26 @@ export async function interpret(request, baseline, draft, current, focus = {}) {
     return done({ reply: { text: stagedReply(made), notes: required.length ? [`${required.join(", ")} has to become optional first, since a cleared link is an empty value.`] : [] }, added: made.map((o) => o.id) });
   }
 
+  if (op.value === "drop_view") {
+    const views = Object.entries(draft.views ?? {}).slice(0, 80);
+    if (!views.length) return decline("There are no views here to drop.");
+    const named = views.filter(([, v]) => spans.some((sp) => sp.ident === v.name));
+    let id = named.length === 1 ? named[0][0] : null;
+    if (id) reading.rule("view", "View", draft.views[id].name);
+    else {
+      const second = await reading.ask({ request }, { view: choice("Which view does `request` ask to delete?", { ...Object.fromEntries(views.map(([vid, v]) => [vid, `The view ${v.name}`])), [NONE]: "None of these." }) });
+      const pick = reading.choice("view", "View", second.view, { labels: { ...Object.fromEntries(views.map(([vid, v]) => [vid, v.name])), [NONE]: "none" }, bar: INFERRED });
+      if (!pick.ok || pick.value === NONE) return decline(`I couldn't tell which view you mean. There ${views.length === 1 ? "is" : "are"}: ${views.map(([, v]) => v.name).join(", ")}.`);
+      id = pick.value;
+    }
+    // A view that is still only in the draft is simply taken back out.
+    const stagedAt = ops.findIndex((o) => o.kind === "create_view" && `${o.schema ?? draft.views[id].schema}.${o.name}` === id);
+    if (stagedAt >= 0) { ops.splice(stagedAt, 1); return done({ reply: { text: `Took the view ${draft.views[id].name} back out of the draft.` }, added: [] }); }
+    const made = [{ id: newId(), kind: "drop_view", view: id }];
+    ops.push(...made);
+    return done({ reply: { text: stagedReply(made), notes: ["A view stores nothing, so no data is lost."] }, added: [made[0].id] });
+  }
+
   // The remaining kinds all change one existing table.
   if (!targetTable) return decline(DECLINES.no_target);
   const t = targetTable;
@@ -735,6 +757,100 @@ export async function interpret(request, baseline, draft, current, focus = {}) {
     return done({ reply: { text: staged ? `Added ${built.columns.map((c) => c.name).join(", ")} to the ${t.label} table in the draft.` : stagedReply(added), notes }, added: added.map((o) => o.id) });
   }
 
+  // Reading one test on a column ("expires at is before now", "status is active", "phone is filled in"). Shared by
+  // calculated columns and views; only a view may compare with the clock, because it is worked out when it is read.
+  const TEST_OPTIONS = {
+    gt: "More than, over, above, greater than, after, later than.", gte: "At least, or more, no less than, from … upwards, on or after.",
+    lt: "Less than, under, below, before, earlier than.", lte: "At most, or less, no more than, up to, on or before.",
+    eq: "Equals, is, is exactly.", neq: "Is not, differs from, anything but.", is_set: "Has a value, is filled in, is present, is known.", is_empty: "Is empty, is missing, is not set, is unknown.",
+  };
+  const conditionQuestions = (columnChoices, values, pickFrom) => ({
+    ctest: choice("If `request` describes a test on a column, which test is it?", TEST_OPTIONS),
+    ccol: choice(`If \`request\` describes a test, which column of "${t.label}" is tested?`, { ...columnChoices, [NONE]: "None of these." }),
+    ccol2: choice(`If the test in \`request\` compares the tested column with another column of "${t.label}", which column is it compared with?`, { ...columnChoices, [NONE]: "It is compared with a fixed value, or with nothing." }),
+    cval: choice("If the test in `request` compares a column with a fixed value, which value is it compared with?", pickFrom(values)),
+  });
+  const readCondition = (second, said, values, columnList, { clock = false } = {}) => {
+    let test = reading.choice("ctest", "Test", second.ctest, { labels: { gt: "more than", gte: "at least", lt: "less than", lte: "at most", eq: "is", neq: "is not", is_set: "has a value", is_empty: "is empty" } });
+    // Words that are a comparison with the clock in themselves.
+    const past = /\b(expired|overdue|in the past|has passed|have passed|lapsed|elapsed)\b/i.test(request), future = /\b(upcoming|in the future|not yet|still valid|still active)\b/i.test(request);
+    if (clock && (past || future) && (!test.ok || !["lt", "lte", "gt", "gte"].includes(test.value))) {
+      test = { ok: true, value: past ? "lt" : "gt" };
+      reading.rule("ctest:clock", "Test", past ? "before now (from the wording)" : "after now (from the wording)");
+    }
+    if (!test.ok) return { error: "I understood this is a condition, but not the test. Say, for example: \"is over 100\", \"is at least 5\", \"is paid\", \"is before now\", \"is filled in\" or \"is empty\"." };
+    const unary = test.value === "is_set" || test.value === "is_empty";
+    const tested = said.length >= 1 && said.length <= 2 ? { ok: true, value: said[0].ident, rule: true } : reading.choice("ccol", "Tested column", second.ccol, { labels: { [NONE]: "not found" } });
+    if (tested.rule) reading.rule("ccol", "Tested column", tested.value);
+    if (!tested.ok || tested.value === NONE) return { error: `I couldn't tell which column the test is about. ${columnList}` };
+    const condition = { column: tested.value, test: test.value };
+    if (unary) return { condition };
+    const column = t.table.columns.find((c) => c.name === tested.value);
+    const isMoment = ["date", "timestamp", "timestamptz"].includes(column?.type.base);
+    // Against the clock: said outright ("before now", "after today"), or implied by a word like "expired".
+    if (clock && isMoment && said.length < 2 && (/\b(now|today|current (time|date)|right now|this moment)\b/i.test(request) || past || future)) {
+      condition.value = { clock: column.type.base === "date" ? "today" : "now" };
+      reading.rule("cval:clock", "Compared with", condition.value.clock);
+      return { condition };
+    }
+    if (said.length === 2) { condition.value = { column: said[1].ident }; reading.rule("ccol2", "Compared with", said[1].ident); return { condition }; }
+    const other = reading.choice("ccol2", "Compared with column", second.ccol2, { labels: { [NONE]: "a fixed value" }, applied: false });
+    const fixed = reading.choice("cval", "Compared with", second.cval, { labels: { ...Object.fromEntries(Object.keys(values).map((k) => [k, k.replace(/^[nes]:/, "")])), [NONE]: "not found" } });
+    if (fixed.ok && fixed.value !== NONE) condition.value = values[fixed.value][0];
+    else if (other.ok && other.value !== NONE && other.value !== tested.value) condition.value = { column: other.value };
+    else return { error: `I found the test but not what to compare with. I can compare with a number, one of the column's allowed values, yes or no, text in quotes, another column${clock ? ", or now and today" : ""}.` };
+    return { condition };
+  };
+
+  if (op.value === "create_view") {
+    const usable = t.table.columns.filter((c) => c.type.base || c.type.enum).slice(0, 60);
+    const columnChoices = Object.fromEntries(usable.map((c) => [c.name, typeLabel(c.type)]));
+    const columnList = `${t.label} has: ${usable.map((c) => c.name).join(", ")}.`;
+    const numbers = numberCandidates(request);
+    const quoted = [...request.matchAll(/"([^"]{1,80})"|'([^']{1,80})'|“([^”]{1,80})”/g)].map((m) => m[1] ?? m[2] ?? m[3]);
+    const labels = usable.flatMap((c) => (draft.enums[c.type.enum]?.values ?? []).filter((v) => new RegExp(`\\b${v.replace(/_/g, "[ _-]")}\\b`, "i").test(request)));
+    const values = {
+      ...Object.fromEntries(numbers.map((n) => [`n:${n.value}`, [{ number: n.value }, `The number ${n.phrase}`]])),
+      ...Object.fromEntries(labels.map((v) => [`e:${v}`, [{ label: v }, `The value "${v.replace(/_/g, " ")}"`]])),
+      ...Object.fromEntries(quoted.map((x) => [`s:${x}`, [{ text: x }, `The text "${x}"`]])),
+      true: [{ bool: true }, "True, yes"], false: [{ bool: false }, "False, no"],
+    };
+    const pickFrom = (set) => ({ ...Object.fromEntries(Object.entries(set).map(([k, [, d]]) => [k, d])), [NONE]: "None of these." });
+    const fresh = dropOverlaps(spans.filter((sp) => !t.table.columns.some((c) => c.name === sp.ident) && !existingByIdent(sp.ident) && !labels.includes(sp.ident)));
+    const nameChoices = Object.fromEntries(fresh.map((sp) => [`s${sp.order}`, `"${sp.text}"`]));
+    const second = await reading.ask({ request }, {
+      vkind: choice("`request` asks for a view of a table. What does the test in it do?", {
+        flag: "It becomes an extra yes/no column: every row is shown, and the new column says whether the test holds for it.",
+        filter: "It picks the rows: only rows for which the test holds are shown.",
+      }),
+      vname: choice("Which phrase in `request` is the name of the view itself?", { ...nameChoices, [NONE]: "The view is not given a name." }),
+      fname: choice("Which phrase in `request` is the name of the new yes/no column?", { ...nameChoices, [NONE]: "There is no new column, or it is not named." }),
+      ...conditionQuestions(columnChoices, values, pickFrom),
+    });
+    const kind = reading.choice("vkind", "The test", second.vkind, { labels: { flag: "adds a yes/no column", filter: "picks the rows" } });
+    if (!kind.ok) return decline("I couldn't tell whether the test should become a yes/no column or pick the rows. Say \"with an is expired flag that is true when …\" or \"showing only … where …\".");
+    const viewSpan = (() => { const v = reading.choice("vname", "View name", second.vname, { labels: { ...Object.fromEntries(fresh.map((sp) => [`s${sp.order}`, sp.ident])), [NONE]: "not named" } }); return v.ok && fresh.find((sp) => `s${sp.order}` === v.value); })();
+    const flagSpan = kind.value === "flag" ? (() => { const v = reading.choice("fname", "New column", second.fname, { labels: { ...Object.fromEntries(fresh.map((sp) => [`s${sp.order}`, sp.ident])), [NONE]: "not named" } }); return v.ok && fresh.find((sp) => `s${sp.order}` === v.value && sp !== viewSpan); })() : null;
+    const said = dropOverlaps(spans.filter((sp) => sp !== viewSpan && sp !== flagSpan && usable.some((c) => c.name === sp.ident))).sort((x, y) => x.run - y.run || x.start - y.start);
+    const got = readCondition(second, said, values, columnList, { clock: true });
+    if (got.error) return decline(got.error);
+
+    // Names that were not given are made by rule, and said to be.
+    const notes = [];
+    const clockWord = /\bexpired\b/i.test(request) ? "expired" : /\boverdue\b/i.test(request) ? "overdue" : /\bupcoming\b/i.test(request) ? "upcoming" : null;
+    const valueWord = got.condition.value?.label ?? (got.condition.test === "is_set" ? `has_${got.condition.column}` : got.condition.test === "is_empty" ? `no_${got.condition.column}` : null);
+    const flagName = kind.value === "flag" ? safeName((flagSpan?.ident ?? (clockWord ? `is_${clockWord}` : valueWord ? (valueWord.startsWith("has_") || valueWord.startsWith("no_") ? valueWord : `is_${valueWord}`) : "")).replace(/^((?:is|has|can|was)_.+)_flag$/, "$1")) : null;
+    if (kind.value === "flag" && !flagName) return decline("I need a name for the yes/no column. Say it like: \"with an is large flag that is true when quantity is over 100\".");
+    if (kind.value === "flag" && !flagSpan) notes.push(`You didn't name the new column, so I called it ${flagName}.`);
+    let viewName = viewSpan ? safeName(viewSpan.ident.replace(/_view$/, "")) : kind.value === "filter" && (clockWord ?? valueWord) ? `${clockWord ?? valueWord}_${t.table.name}` : `${t.table.name}_${kind.value === "flag" ? "status" : "selection"}`;
+    if (viewName === t.table.name) viewName = `${viewName}_view`;
+    if (!viewSpan) notes.push(`You didn't name the view, so I called it ${viewName}. Say "call it …" with your own name if you prefer.`);
+    const made = [{ id: newId(), kind: "create_view", schema: t.table.schema, name: viewName, table: t.id, flags: kind.value === "flag" ? [{ name: flagName, condition: got.condition }] : [], ...(kind.value === "filter" ? { filter: got.condition } : {}) }];
+    ops.push(...made);
+    notes.push("A view stores nothing: it is worked out each time it is read, so a test against now or today is always current. Query it like a table, in Ask or in SQL.");
+    return done({ reply: { text: stagedReply(made), notes }, added: [made[0].id] });
+  }
+
   if (op.value === "computed_column") {
     const usable = t.table.columns.filter((c) => !c.generated && (c.type.base || c.type.enum)).slice(0, 60);
     const columnChoices = Object.fromEntries(usable.map((c) => [c.name, typeLabel(c.type)]));
@@ -770,13 +886,7 @@ export async function interpret(request, baseline, draft, current, focus = {}) {
       newname: choice("Which phrase in `request` is the name of the new, calculated column?", { ...Object.fromEntries(fresh.map((s) => [`s${s.order}`, `"${s.text}"`])), [NONE]: "None of these." }),
       konst: choice("If the calculation in `request` uses a fixed number, which number is it?", pickFrom(Object.fromEntries(Object.entries(values).filter(([k]) => k.startsWith("n:"))))),
       // Asked speculatively; only read when the calculation is a condition.
-      ctest: choice("If `request` describes a test on a column, which test is it?", {
-        gt: "More than, over, above, greater than, after.", gte: "At least, or more, no less than, from … upwards.", lt: "Less than, under, below, before.", lte: "At most, or less, no more than, up to.",
-        eq: "Equals, is, is exactly.", neq: "Is not, differs from, anything but.", is_set: "Has a value, is filled in, is present, is known.", is_empty: "Is empty, is missing, is not set, is unknown.",
-      }),
-      ccol: choice(`If \`request\` describes a test, which column of "${t.label}" is tested?`, { ...columnChoices, [NONE]: "None of these." }),
-      ccol2: choice(`If the test in \`request\` compares the tested column with another column of "${t.label}", which column is it compared with?`, { ...columnChoices, [NONE]: "It is compared with a fixed value, or with nothing." }),
-      cval: choice("If the test in `request` compares a column with a fixed value, which value is it compared with?", pickFrom(values)),
+      ...conditionQuestions(columnChoices, values, pickFrom),
       cthen: choice("If `request` names the value the new column gets when the test holds, which is it?", { ...pickFrom(outcomes), [NONE]: "It is simply yes or no, or none of these." }),
       celse: choice("If `request` names the value the new column gets otherwise, when the test does not hold, which is it?", { ...pickFrom(outcomes), [NONE]: "No otherwise-value is given, or none of these." }),
     });
@@ -798,25 +908,13 @@ export async function interpret(request, baseline, draft, current, focus = {}) {
     if (formula.value === "condition") {
       // A calculated column must give the same answer every time it is worked out, so it cannot depend on the clock.
       if (/\b(today|now|current(ly)?|overdue|expired?|in the past|ago|yet|still|so far|upcoming)\b/i.test(request)) {
-        return decline("A calculated column is worked out once, when the row is written, so it cannot depend on today or now: a flag like \"overdue\" or \"expired\" would be frozen at the moment the row was last written. Compare with a fixed value or another column instead, or ask for this in Ask, where it is evaluated when you look.");
+        return decline(`A calculated column is worked out once, when the row is written, so it cannot depend on today or now: a flag like "overdue" or "expired" would be frozen at the moment the row was last written. A view is worked out each time it is read, so ask for that instead.`, {
+          suggestions: [{ label: `Make it a view of ${t.label}`, say: request.replace(/^\s*add\b/i, "create a view with").replace(new RegExp(`\\bto ${t.label.replace(/_/g, "[ _]")}\\b`, "i"), `of ${t.label.replace(/_/g, " ")}`) }],
+        });
       }
-      const test = reading.choice("ctest", "Test", second.ctest, { labels: { gt: "more than", gte: "at least", lt: "less than", lte: "at most", eq: "is", neq: "is not", is_set: "has a value", is_empty: "is empty" } });
-      if (!test.ok) return decline("I understood this is a condition, but not the test. Say, for example: \"is over 100\", \"is at least 5\", \"is paid\", \"is filled in\" or \"is empty\".");
-      const unary = test.value === "is_set" || test.value === "is_empty";
-      const tested = said.length >= 1 && said.length <= 2 ? { ok: true, value: said[0].ident, rule: true } : reading.choice("ccol", "Tested column", second.ccol, { labels: { [NONE]: "not found" } });
-      if (tested.rule) reading.rule("ccol", "Tested column", tested.value);
-      if (!tested.ok || tested.value === NONE) return decline(`I couldn't tell which column the test is about. ${columnList}`);
-      const condition = { column: tested.value, test: test.value };
-      if (!unary) {
-        if (said.length === 2) { condition.value = { column: said[1].ident }; reading.rule("ccol2", "Compared with", said[1].ident); }
-        else {
-          const other = reading.choice("ccol2", "Compared with column", second.ccol2, { labels: { [NONE]: "a fixed value" }, applied: false });
-          const fixed = reading.choice("cval", "Compared with", second.cval, { labels: { ...Object.fromEntries(Object.keys(values).map((k) => [k, k.replace(/^[nes]:/, "")])), [NONE]: "not found" } });
-          if (fixed.ok && fixed.value !== NONE) condition.value = values[fixed.value][0];
-          else if (other.ok && other.value !== NONE && other.value !== tested.value) condition.value = { column: other.value };
-          else return decline("I found the test but not what to compare with. I can compare with a number, one of the column's allowed values, yes or no, text in quotes, or another column.");
-        }
-      }
+      const got = readCondition(second, said, values, columnList);
+      if (got.error) return decline(got.error);
+      const condition = got.condition;
       // With nothing left to be an outcome, the column is simply yes or no.
       const spare = Object.keys(outcomes).filter((k) => JSON.stringify(outcomes[k][0]) !== JSON.stringify(condition.value));
       const extra = { template: "when", condition };

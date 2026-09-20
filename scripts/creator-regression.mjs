@@ -65,6 +65,12 @@ const CASES = [
   // Changing and removing a combination rule. The third item stages a rule first; the whole draft is compared.
   ["reviews should be unique per product, customer and rating instead", /^add_unique:reviews\(product_id,customer_id,rating\)$/, [{ id: "rule", kind: "add_unique", table: "public.reviews", columns: ["product_id", "customer_id"] }]],
   ["a customer no longer needs to be limited to one review per product, remove that rule", /^$/, [{ id: "rule", kind: "add_unique", table: "public.reviews", columns: ["product_id", "customer_id"] }]],
+  // Views: worked out when read, so the clock is allowed.
+  ["create a view of orders with an is late flag that is true when placed at is before now", /^create_view:orders_status\[is_late:placed_at lt now\]$/],
+  ["create a view called paid orders showing orders where status is paid", /^create_view:paid_orders\{status eq paid\}$/],
+  ["create a view of expired orders: orders where placed at has expired", /^create_view:expired_orders\{placed_at lt now\}$/],
+  ["create a view called big items showing order items where quantity is over 100", /^create_view:big_items\{quantity gt 100\}$/],
+  ["drop the paid orders view", /^$/, [{ id: "v", kind: "create_view", name: "paid_orders", table: "public.orders", flags: [], filter: { column: "status", test: "eq", value: { label: "paid" } } }]],
   // Several changes in one message.
   ["make the sku on products optional, rename categories to collections and index orders by placed at", /^drop_not_null:products\.sku rename_table:categories>collections add_index:orders\(placed_at\)$/],
   ["add a nickname to customers and make it required", /^add_column:customers\.nickname!$/],
@@ -94,6 +100,11 @@ const sig = (o) => {
       if (o.template === "when") return `add_generated_column:${t(o.table)}.${o.name}=when(${o.condition.column} ${o.condition.test}${o.condition.value ? " " + v(o.condition.value) : ""})${o.then ? `?${v(o.then)}:${v(o.else) ?? ""}` : ""}`;
       return `add_generated_column:${t(o.table)}.${o.name}=${o.template}(${o.columns})${o.constant ? `*${v(o.constant)}${o.constantFirst ? " first" : ""}` : ""}`;
     }
+    case "create_view": {
+      const c = (k) => `${k.column} ${k.test}${k.value ? " " + (k.value.clock ?? k.value.column ?? k.value.label ?? k.value.text ?? (k.value.bool != null ? String(k.value.bool) : k.value.number)) : ""}`;
+      return `create_view:${o.name}${o.flags.length ? `[${o.flags.map((f) => `${f.name}:${c(f.condition)}`)}]` : ""}${o.filter ? `{${c(o.filter)}}` : ""}`;
+    }
+    case "drop_view": return `drop_view:${t(o.view)}`;
     case "add_unique": return `add_unique:${t(o.table)}(${o.columns})`;
     case "set_default": return `set_default:${t(o.table)}.${o.column}=${o.default.value ?? o.default.kind}`;
     case "set_fk_action": return `set_fk_action:${t(o.table)}>${o.onDelete}`;
