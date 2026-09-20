@@ -1,4 +1,4 @@
-import { h, api, enc, fmtNum, fmtTime, codeBlock, errorBox, loading, zynnMark, lineIcon, confirmDialog, promptDialog } from "./ui.js";
+import { h, api, enc, fmtNum, fmtTime, codeBlock, errorBox, loading, zynnMark, lineIcon, confirmDialog, promptDialog, download } from "./ui.js";
 import { store, pct, SEND_ICON, judgmentCard } from "./chat.js";
 import { erdDiagram } from "./erd.js";
 
@@ -111,6 +111,23 @@ export function createPage(params, status, { onSchemaChanged, onDatabaseCreated 
       f.ops.length ? h("div.toolbar", h("button.btn.small", { onclick: () => setOps([...ops, ...f.ops]).then(() => { tab = "advisor"; paintSide(); }) }, "Add fix to draft")) : h("p.op-reason.muted", "Advice only: this one needs a manual migration."))));
   }
 
+  // The schema and its migrations as files, so the design can leave this machine.
+  async function exportFiles(which, button) {
+    const label = button.textContent;
+    button.disabled = true;
+    try {
+      const x = await api("/create/export");
+      if (which === "schema") download(x.schema.name, x.schema.content, "application/sql");
+      else if (x.archive) download(x.archive.name, Uint8Array.from(atob(x.archive.base64), (ch) => ch.charCodeAt(0)), "application/x-tar");
+      button.textContent = which === "schema" ? "Saved" : x.archive ? `Saved ${plural(x.migrations.length, "file")}` : "Nothing applied yet";
+    } catch (err) { button.textContent = "Failed"; side.prepend(errorBox(err)); }
+    setTimeout(() => { button.textContent = label; button.disabled = false; }, 1800);
+  }
+  const exportBar = () => h("div.toolbar", { style: "margin-bottom:10px" },
+    h("span.info", "Take the design elsewhere"), h("span.spacer"),
+    h("button.btn.small", { title: "The whole schema as it stands now, runnable on an empty database", onclick: (e) => exportFiles("schema", e.target) }, "Download schema.sql"),
+    h("button.btn.small", { title: "One numbered .sql file per migration applied from this page, as a .tar", onclick: (e) => exportFiles("migrations", e.target) }, "Download migrations"));
+
   function historyTab() {
     const box = h("div", loading());
     api("/create/history").then((entries) => {
@@ -122,7 +139,7 @@ export function createPage(params, status, { onSchemaChanged, onDatabaseCreated 
           : e.reason && h("p.op-reason.muted", `Cannot be undone here: ${e.reason.charAt(0).toLowerCase()}${e.reason.slice(1)}.`))))
         : h("div.panel.empty", "Migrations applied from this page are listed here, kept in a local file on this machine."));
     }).catch((err) => box.replaceChildren(errorBox(err)));
-    return box;
+    return h("div", exportBar(), box);
   }
 
   async function addSampleData() {

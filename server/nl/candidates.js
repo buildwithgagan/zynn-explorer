@@ -193,7 +193,7 @@ const IRREGULAR = { person: "people", child: "children", man: "men", woman: "wom
 const UNCOUNTABLE = new Set(["staff", "media", "data", "news", "series", "equipment", "information", "inventory", "stock", "feedback", "software", "hardware"]);
 
 export function pluralize(word) {
-  if (UNCOUNTABLE.has(word) || Object.values(IRREGULAR).includes(word)) return word;
+  if (UNCOUNTABLE.has(word) || Object.values(IRREGULAR).includes(word) || /\d$/.test(word)) return word;
   if (IRREGULAR[word]) return IRREGULAR[word];
   if (/[^aeiou]y$/.test(word)) return word.slice(0, -1) + "ies";
   if (/(s|x|z|ch|sh)$/.test(word)) return /(ies|[^s]s)$/.test(word) && !/(ss|us|is)$/.test(word) ? word : word + "es";

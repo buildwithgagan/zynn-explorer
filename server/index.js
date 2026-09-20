@@ -121,6 +121,7 @@ app.post("/api/create/seed", route((req) => create.seed(req.body)));
 app.get("/api/create/history", route(() => create.listHistory()));
 app.post("/api/create/undo", route((req) => create.undo(req.body)));
 app.get("/api/create/starters", route(() => create.starters()));
+app.get("/api/create/export", route(() => create.exportSql()));
 
 app.listen(PORT, HOST, async () => {
   console.log(`Zynn Explorer → http://localhost:${PORT}`);
