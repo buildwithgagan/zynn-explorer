@@ -116,9 +116,37 @@ export const GENERATED = {
     arity: 2, symbol: "−", sql: (a, b) => `${a} - ${b}`,
     result: (a, b) => (NUMERIC.includes(a) && NUMERIC.includes(b) ? numericResult(a, b) : MOMENT.includes(a) && a === b ? { base: "interval" } : a === "date" && b === "date" ? { base: "integer" } : null),
   },
+  // Cast first, so 7 / 2 is 3.5 rather than Postgres's whole-number 3, and a zero divisor gives an empty value instead of an error.
+  divide: { arity: 2, symbol: "÷", sql: (a, b) => `(${a})::numeric / NULLIF(${b}, 0)`, result: (a, b) => NUMERIC.includes(a) && NUMERIC.includes(b) && { base: "numeric" } },
   concat: { arity: 2, symbol: "joined with", sql: (a, b) => `${a} || ' ' || ${b}`, result: (a, b) => TEXT.includes(a) && TEXT.includes(b) && { base: "text" } },
   lower: { arity: 1, symbol: "lowercase of", sql: (a) => `lower(${a})`, result: (a) => TEXT.includes(a) && { base: "text" } },
 };
+
+export const ARITHMETIC = ["multiply", "add", "subtract", "divide"];
+export const isNumericBase = (base) => NUMERIC.includes(base);
+export const isWholeBase = (base) => WHOLE.includes(base);
+export const isTextBase = (base) => TEXT.includes(base);
+
+// Tests a condition may use. `a` is a quoted column, `b` a quoted column or a literal built by code.
+export const TESTS = {
+  gt: { words: "is more than", sql: (a, b) => `${a} > ${b}`, ordered: true }, gte: { words: "is at least", sql: (a, b) => `${a} >= ${b}`, ordered: true },
+  lt: { words: "is less than", sql: (a, b) => `${a} < ${b}`, ordered: true }, lte: { words: "is at most", sql: (a, b) => `${a} <= ${b}`, ordered: true },
+  eq: { words: "is", sql: (a, b) => `${a} = ${b}` }, neq: { words: "is not", sql: (a, b) => `${a} <> ${b}` },
+  is_set: { words: "has a value", sql: (a) => `${a} IS NOT NULL`, unary: true }, is_empty: { words: "is empty", sql: (a) => `${a} IS NULL`, unary: true },
+};
+
+/** A constant in a calculation: a finite number or a short piece of text. Never an expression. */
+export function cleanConstant(raw) {
+  if (raw == null) return undefined;
+  if (typeof raw === "object" && raw.text != null) {
+    const text = String(raw.text);
+    if (text.length > 200 || text.includes("\0")) throw fail("That text is too long for a calculation");
+    return { text };
+  }
+  const n = Number(typeof raw === "object" ? raw.number : raw);
+  if (!Number.isFinite(n) || Math.abs(n) > 1e15) throw fail("A constant in a calculation must be an ordinary number");
+  return { number: n };
+}
 
 /** Validate a column default from an op. */
 export function cleanDefault(raw) {
@@ -188,5 +216,9 @@ export function parseCatalogGenerated(expr, columnNames) {
   if ((m = new RegExp(`^\\(?${id} - ${id}\\)?$`).exec(e)) && known(m[1], m[2])) return { template: "subtract", columns: [m[1], m[2]] };
   if ((m = new RegExp(`^\\(?\\(?${id} \\|\\| ' '\\)? \\|\\| ${id}\\)?$`).exec(e)) && known(m[1], m[2])) return { template: "concat", columns: [m[1], m[2]] };
   if ((m = new RegExp(`^lower\\(\\(?${id}\\)?\\)$`).exec(e)) && known(m[1])) return { template: "lower", columns: [m[1]] };
-  return null;
+  // Not one of the plain templates (a constant, a condition, or something written by hand). The shape is left opaque,
+  // but the columns it reads are still found, so they cannot be dropped from under it.
+  const bare = String(expr ?? "").replace(/'(?:[^']|'')*'/g, " ");
+  const reads = columnNames.filter((c) => new RegExp(`(^|[^\\w$"])"?${c.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}"?([^\\w$"]|$)`).test(bare));
+  return reads.length ? { template: null, columns: reads } : null;
 }

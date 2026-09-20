@@ -34,7 +34,7 @@ const OPS = {
   rename_thing: "Give an existing table or column a different name. Examples: 'rename clients to customers', 'call the fullname column name instead'.",
   remove_thing: "Delete an existing table or column. Examples: 'drop the legacy table', 'remove the fax column from contacts', 'get rid of notes'.",
   relate_tables: "Create a new link between two tables that exist but are not linked yet: one belongs to the other, or they are many-to-many. Examples: 'orders belong to customers', 'each post has one author', 'posts can have many tags'.",
-  computed_column: "Add a column whose value is always calculated from other columns of the same row, so it never has to be filled in. Examples: 'add a line total to order items that is quantity times unit price', 'full name should be first name plus last name', 'add a duration that is ends at minus starts at', 'add a lowercase version of email'.",
+  computed_column: "Add a column whose value is always calculated from other columns of the same row (optionally with a fixed number or a condition), so it never has to be filled in. Examples: 'add a line total to order items that is quantity times unit price', 'full name should be first name plus last name', 'add a duration that is ends at minus starts at', 'add a lowercase version of email called email lower', 'add a gross price that is price times 1.2', 'add an is large flag that is true when quantity is over 100', 'shipping fee is 0 when total is over 50, otherwise 5'.",
   unique_together: "Several columns of one table must be unique in combination: a row may repeat each value, but not the same combination. Examples: 'one membership per user per organization', 'provider and provider user id together must be unique', 'plan names must be unique within a product', 'a user can review a product only once'. Also changing or removing such a rule: 'memberships should be unique per organization, user and role instead', 'plan names no longer need to be unique within a product'.",
   on_delete: "Change what happens to linked rows when the row they belong to is deleted: delete them too, keep them and clear the link, or block the deletion. Examples: 'when a user is deleted keep their audit events', 'deleting a customer should delete their orders too', 'do not allow deleting a plan that has subscriptions'.",
   add_index: "Add an index to make lookups faster. Examples: 'index orders by created_at', 'add an index on email'.",
@@ -676,43 +676,136 @@ export async function interpret(request, baseline, draft, current) {
   }
 
   if (op.value === "computed_column") {
-    const usable = t.table.columns.filter((c) => !c.generated && c.type.base).slice(0, 60);
+    const usable = t.table.columns.filter((c) => !c.generated && (c.type.base || c.type.enum)).slice(0, 60);
     const columnChoices = Object.fromEntries(usable.map((c) => [c.name, typeLabel(c.type)]));
     const fresh = dropOverlaps(spans.filter((s) => !t.table.columns.some((c) => c.name === s.ident) && !existingByIdent(s.ident)));
     if (!fresh.length) return decline(DECLINES.no_names);
+
+    // Constants are found in code: numbers (a percentage becomes a fraction), quoted text, and the allowed values of this table's columns.
+    const numbers = numberCandidates(request).map((n) => ({ ...n, percent: new RegExp(`${String(n.phrase).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s?(%|percent\\b|per cent\\b)`, "i").test(request) }));
+    const quoted = [...request.matchAll(/"([^"]{1,80})"|'([^']{1,80})'|“([^”]{1,80})”/g)].map((m) => m[1] ?? m[2] ?? m[3]);
+    const labels = usable.flatMap((c) => (draft.enums[c.type.enum]?.values ?? []).filter((v) => new RegExp(`\\b${v.replace(/_/g, "[ _-]")}\\b`, "i").test(request)));
+    const values = {
+      ...Object.fromEntries(numbers.map((n) => [`n:${n.value}`, [{ number: n.value }, `The number ${n.phrase}`]])),
+      ...Object.fromEntries(labels.map((v) => [`e:${v}`, [{ label: v }, `The value "${v.replace(/_/g, " ")}"`]])),
+      ...Object.fromEntries(quoted.map((q) => [`s:${q}`, [{ text: q }, `The text "${q}"`]])),
+      true: [{ bool: true }, "True, yes"], false: [{ bool: false }, "False, no"],
+    };
+    const outcomes = Object.fromEntries(Object.entries(values).filter(([k]) => k.startsWith("n:") || k.startsWith("s:")));
+    const pickFrom = (set) => ({ ...Object.fromEntries(Object.entries(set).map(([k, [, d]]) => [k, d])), [NONE]: "None of these." });
+
     const second = await reading.ask({ request }, {
-      formula: choice("`request` asks for a column that is calculated from other columns. What is the calculation?", {
-        multiply: "One column multiplied by another: times, multiplied by, the product of.",
-        add: "Two number columns added together: plus, the sum of.",
-        subtract: "One column minus another, or the time between two moments: minus, the difference, how long between, duration.",
+      formula: choice("`request` asks for a column whose value is calculated. What is the calculation?", {
+        multiply: "A column multiplied by another column or by a fixed number: times, multiplied by, the product of, a percentage of.",
+        add: "A column plus another column or a fixed number: plus, the sum of, added to.",
+        subtract: "A column minus another column or a fixed number, or the time between two moments: minus, the difference, how long between, duration.",
+        divide: "A column divided by another column or by a fixed number: divided by, per, a ratio, an average per item.",
         concat: "Two pieces of text joined together, such as a full name from a first and a last name.",
         lower: "The lowercase form of one text column.",
+        condition: "A test on a column decides the value: yes or no, or one value when the test holds and another otherwise. Examples: 'is large when quantity is over 100', 'fee is 0 when total is over 50, otherwise 5', 'has phone when phone is filled in', 'is paid when status is paid'.",
         [NONE]: "A different kind of calculation.",
       }),
       first: choice(`Which existing column of "${t.label}" does the calculation read? If it reads two, give the first: for a subtraction the one subtracted from, for the time between two moments the later one.`, { ...columnChoices, [NONE]: "None of these." }),
       second: choice(`Which column of "${t.label}" is the second value in the calculation? For a subtraction it is the one taken away; for the time between two moments it is the earlier one.`, { ...columnChoices, [NONE]: "There is no second column." }),
       newname: choice("Which phrase in `request` is the name of the new, calculated column?", { ...Object.fromEntries(fresh.map((s) => [`s${s.order}`, `"${s.text}"`])), [NONE]: "None of these." }),
+      konst: choice("If the calculation in `request` uses a fixed number, which number is it?", pickFrom(Object.fromEntries(Object.entries(values).filter(([k]) => k.startsWith("n:"))))),
+      // Asked speculatively; only read when the calculation is a condition.
+      ctest: choice("If `request` describes a test on a column, which test is it?", {
+        gt: "More than, over, above, greater than, after.", gte: "At least, or more, no less than, from … upwards.", lt: "Less than, under, below, before.", lte: "At most, or less, no more than, up to.",
+        eq: "Equals, is, is exactly.", neq: "Is not, differs from, anything but.", is_set: "Has a value, is filled in, is present, is known.", is_empty: "Is empty, is missing, is not set, is unknown.",
+      }),
+      ccol: choice(`If \`request\` describes a test, which column of "${t.label}" is tested?`, { ...columnChoices, [NONE]: "None of these." }),
+      ccol2: choice(`If the test in \`request\` compares the tested column with another column of "${t.label}", which column is it compared with?`, { ...columnChoices, [NONE]: "It is compared with a fixed value, or with nothing." }),
+      cval: choice("If the test in `request` compares a column with a fixed value, which value is it compared with?", pickFrom(values)),
+      cthen: choice("If `request` names the value the new column gets when the test holds, which is it?", { ...pickFrom(outcomes), [NONE]: "It is simply yes or no, or none of these." }),
+      celse: choice("If `request` names the value the new column gets otherwise, when the test does not hold, which is it?", { ...pickFrom(outcomes), [NONE]: "No otherwise-value is given, or none of these." }),
     });
-    const formula = reading.choice("formula", "Calculation", second.formula, { labels: { multiply: "a × b", add: "a + b", subtract: "a − b", concat: "a joined with b", lower: "lowercase of a", [NONE]: "something else" } });
-    if (!formula.ok || formula.value === NONE) return decline("I can calculate a column as one column times, plus or minus another, the time between two moments, two texts joined, or the lowercase of a text. Anything else needs the SQL editor.");
+    const formula = reading.choice("formula", "Calculation", second.formula, { labels: { multiply: "a × b", add: "a + b", subtract: "a − b", divide: "a ÷ b", concat: "a joined with b", lower: "lowercase of a", condition: "a condition", [NONE]: "something else" } });
+    if (!formula.ok || formula.value === NONE) return decline("I can calculate a column as one column times, plus, minus or divided by another column or a number, the time between two moments, two texts joined, the lowercase of a text, or a condition on a column. Anything else needs the SQL editor.");
     const name = reading.choice("newname", "New column", second.newname, { labels: { ...Object.fromEntries(fresh.map((s) => [`s${s.order}`, s.ident])), [NONE]: "not found" } });
     const span = name.ok && fresh.find((s) => `s${s.order}` === name.value);
     if (!span) return decline("I couldn't find what to call the new column. Say it like: \"add a line total to order items that is quantity times unit price\".");
+    const columnList = `${t.label} has: ${usable.map((c) => c.name).join(", ")}.`;
     // Columns named outright are taken as said, in the order said.
+    const said = dropOverlaps(spans.filter((s) => s !== span && usable.some((c) => c.name === s.ident))).sort((x, y) => x.run - y.run || x.start - y.start);
+    const finish = (extra, notes = []) => {
+      // "an is bulk flag" is the flag is_bulk: the word that says what kind of thing it is, is not part of its name.
+      const made = [{ id: newId(), kind: "add_generated_column", table: t.id, name: safeName(span.ident.replace(/^((?:is|has|can|was)_.+)_flag$/, "$1")), ...extra }];
+      ops.push(...made);
+      return done({ reply: { text: stagedReply(made), notes: [...notes, "Postgres calculates it for every row, existing ones included, and keeps it current. It cannot be written to directly."] }, added: [made[0].id] });
+    };
+
+    if (formula.value === "condition") {
+      // A calculated column must give the same answer every time it is worked out, so it cannot depend on the clock.
+      if (/\b(today|now|current(ly)?|overdue|expired?|in the past|ago|yet|still|so far|upcoming)\b/i.test(request)) {
+        return decline("A calculated column is worked out once, when the row is written, so it cannot depend on today or now: a flag like \"overdue\" or \"expired\" would be frozen at the moment the row was last written. Compare with a fixed value or another column instead, or ask for this in Ask, where it is evaluated when you look.");
+      }
+      const test = reading.choice("ctest", "Test", second.ctest, { labels: { gt: "more than", gte: "at least", lt: "less than", lte: "at most", eq: "is", neq: "is not", is_set: "has a value", is_empty: "is empty" } });
+      if (!test.ok) return decline("I understood this is a condition, but not the test. Say, for example: \"is over 100\", \"is at least 5\", \"is paid\", \"is filled in\" or \"is empty\".");
+      const unary = test.value === "is_set" || test.value === "is_empty";
+      const tested = said.length >= 1 && said.length <= 2 ? { ok: true, value: said[0].ident, rule: true } : reading.choice("ccol", "Tested column", second.ccol, { labels: { [NONE]: "not found" } });
+      if (tested.rule) reading.rule("ccol", "Tested column", tested.value);
+      if (!tested.ok || tested.value === NONE) return decline(`I couldn't tell which column the test is about. ${columnList}`);
+      const condition = { column: tested.value, test: test.value };
+      if (!unary) {
+        if (said.length === 2) { condition.value = { column: said[1].ident }; reading.rule("ccol2", "Compared with", said[1].ident); }
+        else {
+          const other = reading.choice("ccol2", "Compared with column", second.ccol2, { labels: { [NONE]: "a fixed value" }, applied: false });
+          const fixed = reading.choice("cval", "Compared with", second.cval, { labels: { ...Object.fromEntries(Object.keys(values).map((k) => [k, k.replace(/^[nes]:/, "")])), [NONE]: "not found" } });
+          if (fixed.ok && fixed.value !== NONE) condition.value = values[fixed.value][0];
+          else if (other.ok && other.value !== NONE && other.value !== tested.value) condition.value = { column: other.value };
+          else return decline("I found the test but not what to compare with. I can compare with a number, one of the column's allowed values, yes or no, text in quotes, or another column.");
+        }
+      }
+      // With nothing left to be an outcome, the column is simply yes or no.
+      const spare = Object.keys(outcomes).filter((k) => JSON.stringify(outcomes[k][0]) !== JSON.stringify(condition.value));
+      const extra = { template: "when", condition };
+      if (spare.length) {
+        const then = reading.choice("cthen", "When it holds", second.cthen, { labels: { ...Object.fromEntries(Object.keys(outcomes).map((k) => [k, k.slice(2)])), [NONE]: "yes / no" } });
+        const otherwise = reading.choice("celse", "Otherwise", second.celse, { labels: { ...Object.fromEntries(Object.keys(outcomes).map((k) => [k, k.slice(2)])), [NONE]: "nothing" } });
+        if (then.ok && then.value !== NONE) {
+          extra.then = outcomes[then.value][0];
+          if (otherwise.ok && otherwise.value !== NONE && otherwise.value !== then.value) extra.else = outcomes[otherwise.value][0];
+        }
+      }
+      return finish(extra, extra.then && !extra.else ? ["No otherwise-value was given, so the column is empty when the test does not hold."] : []);
+    }
+
     const arity = GENERATED[formula.value].arity;
-    const said = dropOverlaps(spans.filter((s) => s !== span && usable.some((c) => c.name === s.ident))).sort((x, y) => x.run - y.run || x.start - y.start).map((s) => s.ident);
+    const names = said.map((x) => x.ident);
+    const arithmetic = ["multiply", "add", "subtract", "divide"].includes(formula.value);
     // "a minus b" says its own order, and "subtract b from a" says it reversed. "The time between a and b" does not, so Jev decides that.
-    const spoken = /\bminus\b|\bless\b/i.test(request) ? "as_said" : /\bsubtract(ed|ing)?\b.*\bfrom\b/i.test(request) ? "reversed" : null;
-    if (formula.value === "subtract" && spoken === "reversed") said.reverse();
-    const byRule = said.length === arity && (formula.value !== "subtract" || spoken);
-    if (byRule) said.forEach((c, i) => reading.rule(`in:${i}`, i ? "Second value" : "First value", c));
-    const a = byRule ? { ok: true, value: said[0] } : reading.choice("first", "First value", second.first, { labels: { [NONE]: "not found" } });
-    const b = arity === 2 ? (byRule ? { ok: true, value: said[1] } : reading.choice("second", "Second value", second.second, { labels: { [NONE]: "not found" } })) : null;
-    if (!a.ok || a.value === NONE || (b && (!b.ok || b.value === NONE))) return decline(`I couldn't match the columns to calculate from. ${t.label} has: ${usable.map((c) => c.name).join(", ")}.`);
+    const spoken = /\bminus\b|\bless\b|\bdivided by\b|\bover\b/i.test(request) ? "as_said" : /\b(subtract(ed|ing)?|take|taking)\b.*\bfrom\b/i.test(request) ? "reversed" : null;
+
+    if (arithmetic && names.length < 2 && numbers.length) {
+      // One column and a fixed number: "price times 1.2", "20 percent of price", "monthly price times 12".
+      const col = names.length === 1 ? { ok: true, value: names[0], rule: true } : reading.choice("first", "Column", second.first, { labels: { [NONE]: "not found" } });
+      if (col.rule) reading.rule("in:0", "Column", col.value);
+      if (!col.ok || col.value === NONE) return decline(`I couldn't match the column to calculate from. ${columnList}`);
+      let n = numbers.length === 1 ? numbers[0] : null;
+      if (n) reading.rule("konst", "Fixed number", n.phrase);
+      else {
+        const k = reading.choice("konst", "Fixed number", second.konst, { labels: { ...Object.fromEntries(numbers.map((x) => [`n:${x.value}`, x.phrase])), [NONE]: "not found" } });
+        n = k.ok && numbers.find((x) => `n:${x.value}` === k.value);
+        if (!n) return decline("I couldn't tell which number the calculation uses. Say it with one number, for example: \"price times 1.2\".");
+      }
+      if (n.percent && formula.value !== "multiply") return decline(`"${n.phrase} percent" only makes sense as a share of something. Say it as a multiplication, for example "${col.value} times ${(1 + n.value / 100).toFixed(2).replace(/0+$/, "").replace(/\.$/, "")}" to add ${n.phrase} percent, or "${n.phrase} percent of ${col.value}" for the share itself.`);
+      const constant = n.percent ? n.value / 100 : n.value;
+      // Order only matters for minus and divided by, and the sentence shows it: which came first, the number or the column?
+      const colSpan = said[0]?.text ?? col.value.replace(/_/g, " ");
+      const numberCameFirst = request.toLowerCase().indexOf(String(n.phrase).toLowerCase()) < request.toLowerCase().indexOf(colSpan.toLowerCase());
+      const constantFirst = ["subtract", "divide"].includes(formula.value) && (spoken === "reversed" ? !numberCameFirst : numberCameFirst);
+      return finish({ template: formula.value, columns: [col.value], constant: { number: constant }, ...(constantFirst ? { constantFirst: true } : {}) }, n.percent ? [`${n.phrase} percent is the fraction ${constant}.`] : []);
+    }
+
+    if (formula.value === "subtract" && spoken === "reversed") names.reverse();
+    const byRule = names.length === arity && (!["subtract", "divide"].includes(formula.value) || spoken);
+    if (byRule) names.forEach((c, i) => reading.rule(`in:${i}`, i ? "Second value" : "First value", c));
+    const a = byRule ? { ok: true, value: names[0] } : reading.choice("first", "First value", second.first, { labels: { [NONE]: "not found" } });
+    const b = arity === 2 ? (byRule ? { ok: true, value: names[1] } : reading.choice("second", "Second value", second.second, { labels: { [NONE]: "not found" } })) : null;
+    if (!a.ok || a.value === NONE || (b && (!b.ok || b.value === NONE))) return decline(`I couldn't match the columns to calculate from. ${columnList}`);
     if (b && a.value === b.value) return decline(`Both values came out as ${a.value}. Name the two columns, for example "quantity times unit price".`);
-    const made = [{ id: newId(), kind: "add_generated_column", table: t.id, name: safeName(span.ident), template: formula.value, columns: b ? [a.value, b.value] : [a.value] }];
-    ops.push(...made);
-    return done({ reply: { text: stagedReply(made), notes: ["Postgres calculates it for every row, existing ones included, and keeps it current. It cannot be written to directly."] }, added: [made[0].id] });
+    return finish({ template: formula.value, columns: b ? [a.value, b.value] : [a.value] }, formula.value === "divide" ? ["Where the divisor is zero the result is empty, rather than an error that would block the row."] : []);
   }
 
   if (op.value === "unique_together") {

@@ -1,5 +1,5 @@
 import { quoteIdent, qualified, quoteLiteral } from "../db.js";
-import { typeSql, typeLabel, sameType, isSafeWidening, CHECKS, ON_DELETE, PRIVILEGES, POLICY_COMMANDS, GENERATED, INTERVAL_UNITS } from "./types.js";
+import { typeSql, typeLabel, sameType, isSafeWidening, CHECKS, ON_DELETE, PRIVILEGES, POLICY_COMMANDS, GENERATED, INTERVAL_UNITS, ARITHMETIC, TESTS, isNumericBase, isWholeBase, isTextBase } from "./types.js";
 import {
   OpError, checkNewIdent, constraintName, relationNames, constraintNames, getTable, getColumn, referenceable, checkFkTypes,
 } from "./validate.js";
@@ -105,6 +105,81 @@ function addIndex(design, table, columns, unique, out, why) {
     reason: caution ? `Building an index on about ${table.estRows.toLocaleString("en-US")} rows blocks writes to ${table.name} until it finishes` : unique && why !== "new" ? "Fails if existing rows hold duplicates" : why === "fk" ? "Index on a foreign key, so joins and deletes on the parent stay fast" : undefined,
   });
   return name;
+}
+
+const numberSql = (n) => (n < 0 ? `(${String(Number(n))})` : String(Number(n)));
+const constantSql = (c) => (c.text != null ? quoteLiteral(c.text) : numberSql(c.number));
+
+/** The expression, result type and input columns of a calculated column. Built from templates, quoted names and literals only. */
+function generatedExpression(d, t, op) {
+  const input = (name) => {
+    const c = getColumn(t, name);
+    if (c.generated) throw new OpError("A calculated column cannot be built from another calculated column");
+    return c;
+  };
+  if (op.template === "when") {
+    const k = op.condition;
+    const test = k && Object.hasOwn(TESTS, k.test ?? "") ? TESTS[k.test] : null;
+    if (!test) throw new OpError("That condition is not one Creator can write");
+    const a = input(k.column);
+    const reads = [a.name];
+    let right = null;
+    if (!test.unary) {
+      const v = k.value;
+      if (!v) throw new OpError("The condition needs something to compare with");
+      const ordered = isNumericBase(a.type.base) || ["date", "timestamp", "timestamptz", "interval"].includes(a.type.base);
+      if (test.ordered && !ordered) throw new OpError(`"${test.words}" needs a number or a date, and ${a.name} is ${typeLabel(a.type)}`);
+      if (v.column != null) {
+        const b = input(v.column);
+        if (!sameType(a.type, b.type) && !(isNumericBase(a.type.base) && isNumericBase(b.type.base))) throw new OpError(`${a.name} (${typeLabel(a.type)}) and ${b.name} (${typeLabel(b.type)}) cannot be compared`);
+        if (b.name === a.name) throw new OpError("A column cannot be compared with itself");
+        reads.push(b.name);
+        right = quoteIdent(b.name);
+      } else if (v.label != null) {
+        const e = a.type.enum && d.enums[a.type.enum];
+        if (!e?.values.includes(v.label)) throw new OpError(`"${v.label}" is not one of the values ${a.name} can hold`);
+        if (test.ordered) throw new OpError("An allowed value can only be tested with is / is not");
+        right = `${quoteLiteral(v.label)}::${qualified(e.schema, e.name)}`;
+      } else if (v.bool != null) {
+        if (a.type.base !== "boolean" || test.ordered) throw new OpError(`${a.name} is not a yes/no column`);
+        right = v.bool ? "true" : "false";
+      } else if (v.number != null) {
+        if (!isNumericBase(a.type.base)) throw new OpError(`${a.name} is ${typeLabel(a.type)}, which cannot be compared with a number`);
+        right = numberSql(v.number);
+      } else if (v.text != null) {
+        if (!isTextBase(a.type.base) || test.ordered) throw new OpError(`${a.name} is ${typeLabel(a.type)}, which cannot be compared with that text`);
+        right = quoteLiteral(v.text);
+      } else throw new OpError("The condition needs something to compare with");
+    }
+    const condition = test.sql(quoteIdent(a.name), right);
+    if (!op.then) {
+      if (op.else) throw new OpError("An otherwise-value needs a value for when the condition holds");
+      return { sql: condition, type: { base: "boolean" }, reads };
+    }
+    if (op.else && (op.then.text != null) !== (op.else.text != null)) throw new OpError("Both outcomes must be numbers, or both text");
+    const type = op.then.text != null ? { base: "text" } : { base: "numeric" };
+    return { sql: `CASE WHEN ${condition} THEN ${constantSql(op.then)}${op.else ? ` ELSE ${constantSql(op.else)}` : ""} END`, type, reads };
+  }
+
+  const g = Object.hasOwn(GENERATED, op.template ?? "") ? GENERATED[op.template] : null;
+  if (!g) throw new OpError("That calculation is not one Creator can write");
+  if (op.constant) {
+    if (!ARITHMETIC.includes(op.template) || op.constant.number == null) throw new OpError("Only times, plus, minus and divided by can use a fixed number");
+    if (op.columns.length !== 1) throw new OpError("A calculation with a fixed number uses exactly one column");
+    const a = input(op.columns[0]);
+    if (!isNumericBase(a.type.base)) throw new OpError(`${a.name} is ${typeLabel(a.type)}, not a number`);
+    const n = op.constant.number;
+    if (op.template === "divide" && !op.constantFirst && n === 0) throw new OpError("Dividing by zero is not a calculation");
+    const col = quoteIdent(a.name), k = numberSql(n);
+    const sql = op.template === "divide" ? (op.constantFirst ? `${k}::numeric / NULLIF(${col}, 0)` : `(${col})::numeric / ${k}`) : g.sql(...(op.constantFirst ? [k, col] : [col, k]));
+    const whole = isWholeBase(a.type.base) && Number.isInteger(n) && op.template !== "divide";
+    return { sql, type: { base: whole ? "bigint" : "numeric" }, reads: [a.name] };
+  }
+  if (op.columns.length !== g.arity) throw new OpError(`That calculation needs ${g.arity} column${g.arity === 1 ? "" : "s"}`);
+  const inputs = op.columns.map(input);
+  const type = g.result(...inputs.map((c) => c.type.base));
+  if (!type) throw new OpError(`${inputs.map((c) => `${c.name} (${typeLabel(c.type)})`).join(" and ")} cannot be combined that way`);
+  return { sql: g.sql(...op.columns.map(quoteIdent)), type, reads: [...op.columns] };
 }
 
 function grantTargets(design, op) {
@@ -232,17 +307,11 @@ const STEPS = {
     checkNewIdent(op.name, "column name");
     if (t.columns.some((c) => c.name === op.name)) throw new OpError(`${t.name} already has a column "${op.name}"`);
     if (d.versionNum < 120000) throw new OpError("Calculated columns need Postgres 12 or newer");
-    const g = Object.hasOwn(GENERATED, op.template ?? "") ? GENERATED[op.template] : null;
-    if (!g) throw new OpError("That calculation is not one Creator can write");
-    if (op.columns.length !== g.arity) throw new OpError(`That calculation needs ${g.arity} column${g.arity === 1 ? "" : "s"}`);
-    const inputs = op.columns.map((c) => getColumn(t, c));
-    if (inputs.some((c) => c.generated)) throw new OpError("A calculated column cannot be built from another calculated column");
-    const type = g.result(...inputs.map((c) => c.type.base));
-    if (!type) throw new OpError(`${inputs.map((c) => `${c.name} (${typeLabel(c.type)})`).join(" and ")} cannot be combined that way`);
-    t.columns.push({ name: op.name, type, nullable: true, default: null, identity: null, generated: true, generatedAs: { template: op.template, columns: [...op.columns] }, comment: null });
+    const { sql: expression, type, reads } = generatedExpression(d, t, op);
+    t.columns.push({ name: op.name, type, nullable: true, default: null, identity: null, generated: true, generatedAs: { template: op.template, columns: reads }, comment: null });
     const big = t.estRows > BIG_TABLE;
     out.push({
-      sql: `ALTER TABLE ${tableSql(t)} ADD COLUMN ${quoteIdent(op.name)} ${typeSql(type, enumSql(d))} GENERATED ALWAYS AS (${g.sql(...op.columns.map(quoteIdent))}) STORED;`,
+      sql: `ALTER TABLE ${tableSql(t)} ADD COLUMN ${quoteIdent(op.name)} ${typeSql(type, enumSql(d))} GENERATED ALWAYS AS (${expression}) STORED;`,
       level: big ? "caution" : "safe",
       reason: big ? `Every row of ${t.name} is rewritten to fill it in; writes wait until that finishes` : "Postgres keeps it up to date; it cannot be written to directly",
     });

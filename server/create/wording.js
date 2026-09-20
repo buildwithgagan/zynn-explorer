@@ -1,4 +1,4 @@
-import { typeLabel, defaultLabel, GENERATED } from "./types.js";
+import { typeLabel, defaultLabel, GENERATED, TESTS } from "./types.js";
 
 // Jev cannot write prose, so everything Creator says is composed here.
 
@@ -18,6 +18,9 @@ function columnPhrase(c) {
   return `${c.name} (${bits.join(", ")})`;
 }
 
+const describeCalculated = (op, t) => (GENERATED[op.template]?.arity === 1 ? `Add ${op.name} to ${t}, always the ${GENERATED[op.template].symbol} ${op.columns[0]}`
+  : `Add ${op.name} to ${t}, always ${op.columns[0]} ${GENERATED[op.template]?.symbol ?? "?"} ${op.columns[1]}`);
+
 /** One line describing an op, for the Changes list and for history. */
 export function describeOp(op) {
   const t = tableName(op.table);
@@ -28,8 +31,17 @@ export function describeOp(op) {
     case "drop_table": return `Drop table ${t}`;
     case "set_comment": return `Describe ${op.column ? `${t}.${op.column}` : t}`;
     case "add_column": return `Add ${columnPhrase(op.column)} to ${t}`;
-    case "add_generated_column": return GENERATED[op.template]?.arity === 1 ? `Add ${op.name} to ${t}, always the ${GENERATED[op.template].symbol} ${op.columns[0]}`
-      : `Add ${op.name} to ${t}, always ${op.columns[0]} ${GENERATED[op.template]?.symbol ?? "?"} ${op.columns[1]}`;
+    case "add_generated_column": {
+      const say = (c) => (typeof c !== "object" ? String(c) : c.text != null ? `"${c.text}"` : String(c.number));
+      if (op.template === "when" && op.condition) {
+        const k = op.condition, v = k.value;
+        const right = !v ? "" : ` ${v.column ?? v.label?.replace(/_/g, " ") ?? (v.bool != null ? (v.bool ? "yes" : "no") : say(v))}`;
+        const when = `${k.column} ${TESTS[k.test]?.words ?? "?"}${right}`;
+        return op.then ? `Add ${op.name} to ${t}: ${say(op.then)} when ${when}${op.else ? `, otherwise ${say(op.else)}` : ""}` : `Add ${op.name} to ${t}: yes when ${when}`;
+      }
+      if (op.constant) return `Add ${op.name} to ${t}, always ${op.constantFirst ? `${say(op.constant)} ${GENERATED[op.template]?.symbol} ${op.columns[0]}` : `${op.columns[0]} ${GENERATED[op.template]?.symbol} ${say(op.constant)}`}`;
+      return describeCalculated(op, t);
+    }
     case "drop_column": return `Drop ${t}.${op.column}`;
     case "rename_column": return `Rename ${t}.${op.column} to ${op.name}`;
     case "alter_column_type": return `Change ${t}.${op.column} to ${typeLabel(op.type)}`;
