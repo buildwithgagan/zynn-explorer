@@ -1,6 +1,7 @@
 import { qualified, quoteIdent } from "../db.js";
 import { topoTables } from "./design.js";
 import { ARCHETYPES, inferArchetype, mulberry32 } from "./archetypes.js";
+import { cohere, isAuditMoment } from "./coherence.js";
 
 // Sample rows are generated in code from each column's archetype, so they respect types, enums, the
 // check templates Creator knows, uniqueness, and foreign keys (children only ever point at real parents).
@@ -21,6 +22,9 @@ export function columnPlan(design, id) {
     const fk = table.fks.find((f) => f.columns.length === 1 && f.columns[0] === c.name);
     if (table.fks.some((f) => f.columns.length > 1 && f.columns.includes(c.name))) throw fail(`${table.name} has a multi-column foreign key, which sample data cannot fill yet`);
     if (fk) { plan.push({ column: c, source: "fk", fk }); continue; }
+    // created_at / updated_at default to now(), which would stamp every sample row with the instant of the insert.
+    // They are filled in instead, so rows are spread over time and come after the rows they belong to.
+    if (isAuditMoment(c) && c.default?.kind === "now") { plan.push({ column: c, source: "gen", archetype: "timestamp" }); continue; }
     if (["now", "now_plus", "uuid"].includes(c.default?.kind) || c.default?.raw) continue;
     if (c.type.enum) { plan.push({ column: c, source: "enum", values: design.enums[c.type.enum].values }); continue; }
     const isKey = table.pk?.columns.includes(c.name);
@@ -57,7 +61,15 @@ function fit(value, item, i, offset) {
  * Rows for one table. `parentKeys` maps a referenced table id to the key values that exist for it.
  * → { columns: [name], rows: [[value]] }
  */
-export function generateRows(design, id, count, rng, parentKeys, { offset = 0 } = {}) {
+const DAY = 86_400_000;
+/** Today at 00:00 UTC: sample times hang off it, so the same seed gives the same rows all day. */
+export const today = () => Math.floor(Date.now() / DAY) * DAY;
+
+/**
+ * `parentMoments` maps a referenced table id to Map(key → when that row was created), so a child never predates its parent.
+ * → also `moments`: when each generated row was created.
+ */
+export function generateRows(design, id, count, rng, parentKeys, { offset = 0, now = today(), parentMoments = {} } = {}) {
   const table = design.tables[id];
   const plan = columnPlan(design, id);
   const fkItems = plan.filter((p) => p.source === "fk");
@@ -89,7 +101,12 @@ export function generateRows(design, id, count, rng, parentKeys, { offset = 0 } 
       return fit(ARCHETYPES[p.archetype].gen(rng, offset + i), p, i, offset);
     }));
   }
-  return { columns: plan.map((p) => p.column.name), rows };
+  // Each value was made on its own. Now read every row as a whole and make it one that could exist.
+  const moments = rows.map((row) => {
+    const parents = plan.map((p, c) => (p.source === "fk" && row[c] != null ? parentMoments[p.fk.refTable]?.get(String(row[c])) : null)).filter((m) => m != null);
+    return cohere(row, plan, { rng, now, notBefore: parents.length ? Math.max(...parents) : null });
+  });
+  return { columns: plan.map((p) => p.column.name), rows, moments };
 }
 
 /** Insert sample rows through `exec` (one statement at a time, inside the migration's transaction). */
@@ -97,7 +114,7 @@ export async function run(exec, design, { tables, rows, seedValue }) {
   const { order } = topoTables(design, tables);
   if (order.length * rows > MAX_ROWS_PER_MIGRATION) throw fail(`That is more than ${MAX_ROWS_PER_MIGRATION.toLocaleString("en-US")} sample rows in one go. Ask for fewer rows or fewer tables`);
   const rng = mulberry32(seedValue);
-  const keys = {};
+  const keys = {}, moments = {}, now = today();
   let inserted = 0;
   for (const id of order) {
     const table = design.tables[id];
@@ -109,7 +126,8 @@ export async function run(exec, design, { tables, rows, seedValue }) {
       keys[fk.refTable] = found.rows.map((r) => r[0]);
     }
     const offset = Number((await exec(`select count(*) from ${target}`)).rows[0][0]);
-    const data = generateRows(design, id, rows, rng, keys, { offset });
+    const data = generateRows(design, id, rows, rng, keys, { offset, now, parentMoments: moments });
+    moments[id] ??= new Map();
     const pk = table.pk?.columns.length === 1 ? table.pk.columns[0] : null;
     keys[id] ??= [];
     for (let at = 0; at < data.rows.length; at += BATCH) {
@@ -122,7 +140,7 @@ export async function run(exec, design, { tables, rows, seedValue }) {
         ? `insert into ${target} (${data.columns.map(quoteIdent).join(", ")}) values ${values}`
         : `insert into ${target} select from generate_series(1, ${batch.length})`;
       const result = await exec(sql + (pk ? ` returning ${quoteIdent(pk)}` : ""), batch.flat());
-      if (pk) keys[id].push(...result.rows.map((r) => r[0]));
+      if (pk) result.rows.forEach((r, n) => { keys[id].push(r[0]); moments[id].set(String(r[0]), data.moments[at + n]); });
       inserted += batch.length;
     }
   }

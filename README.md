@@ -204,6 +204,17 @@ page. If the schema changed since the preview, Apply refuses and shows the refre
 migrations are logged in `migrations.local.json` (git-ignored, this machine only); the latest one can be
 undone from **History** when every step is reversible.
 
+**Sample data that makes sense.** Values are generated one column at a time from their archetypes, then a coherence pass
+(`server/create/coherence.js`) reads each row as a whole, by column name and type, with no model involved. Time runs
+forwards: a row is created some time in the last year or so, starts at or after that, and its due / expiry / period-end
+dates fall around today, so some have passed and more have not. `created_at` and `updated_at` are filled in rather than
+left to `now()`, which would stamp every row with the instant of the insert; a child row is never older than the rows
+it belongs to. Events follow status: `paid_at` is set exactly when the status is paid, `cancelled_at` when cancelled, a
+pending user has no `email_verified_at`; events with no status behind them happen at plausible rates (revoking is rare,
+logging in is not). A few numeric relations hold: a yearly price is ten monthly ones, max is not below min, a line total
+is quantity × unit price, a journal line is a debit or a credit, failed-attempt counters are mostly zero. A column the
+rules do not recognise is left as generated. The same seed gives the same rows for a whole day.
+
 **Taking the design elsewhere.** History has two downloads ("export the schema" in the chat leads there).
 `<database>_schema.sql` is the whole schema as it stands now, written from the live catalog in an order that runs on an
 empty database: schemas, enums, tables parents-first with their keys, rules, links and indexes, comments; roles are
@@ -329,7 +340,7 @@ unique, not unique, type, rename, remove), and removing a draft table also remov
 Jev selects; it cannot invent. A name must appear in your message or in a blueprint, so "a table for the
 things people buy" gets a question back, not a guess. Up to six changes per message, each costing its own
 Jev requests (about 0.4 s and 6k tokens apiece). Domains outside the
-ten blueprints start as plain named tables for you to fill in. Sample data is plausible, not realistic,
+ten blueprints start as plain named tables for you to fill in. Sample data is coherent but invented (names, amounts and texts come from short word lists),
 and triggers or hand-written checks on existing tables can reject it (the trial run says which). Not
 covered: views over more than one table or with several tests, functions, triggers, partitioning, composite foreign keys, converting existing data to an enum, calculations with more than two columns, several conditions at once (a stored column that
 depends on the current time is refused by design: that is what a view is for), and defaults other than a number, true/false, now, today, a time from now, a UUID, an empty
@@ -364,6 +375,7 @@ server/create/archetypes.js field archetypes: type, constraints, default, sample
 server/create/blueprints/   declarative whole-domain designs
 server/create/advisor.js    schema review rules (no model)
 server/create/seed.js       FK-consistent sample data
+server/create/coherence.js  makes each sample row one that could exist: time order, events vs status, numeric relations
 server/create/apply.js      trial run + one-transaction apply; history.js logs it
 server/create/export.js     schema.sql and numbered migration files (as a tar), for taking the design elsewhere
 server/create/wording.js    everything Create says
