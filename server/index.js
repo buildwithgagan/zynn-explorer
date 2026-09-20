@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import * as db from "./db.js";
 import * as introspect from "./introspect.js";
 import * as nl from "./nl/index.js";
+import * as create from "./create/index.js";
 import * as saved from "./saved.js";
 import { invalidateModel } from "./nl/model.js";
 import { isConfigured as jevConfigured } from "./jev.js";
@@ -23,12 +24,22 @@ app.use("/api", (req, res, next) => {
   next();
 });
 
+/**
+ * An error's message, never blank. Connecting to "localhost" tries ::1 and 127.0.0.1; when both
+ * fail Node raises an AggregateError whose own message is empty and whose reasons are in `.errors`.
+ */
+function errorText(err) {
+  if (err?.message) return err.message;
+  const inner = [...new Set((err?.errors ?? []).map((e) => e?.message).filter(Boolean))];
+  return inner.join("; ") || err?.code || "The request failed, and the server gave no reason.";
+}
+
 const route = (handler) => async (req, res) => {
   try {
     res.json(await handler(req));
   } catch (err) {
     const status = err.status ?? (err.code ? 400 : 500); // pg errors carry a SQLSTATE code
-    res.status(status).json({ error: err.message, code: err.code, position: err.position, hint: err.hint, detail: err.detail });
+    res.status(status).json({ error: errorText(err), code: err.code, position: err.position, hint: err.hint, detail: err.detail });
   }
 };
 
@@ -99,6 +110,17 @@ app.post("/api/nl/ask", route(async (req) => {
 
 app.get("/api/nl/suggestions", route(() => nl.suggestions()));
 app.post("/api/nl/rerun", route((req) => nl.rerun(req.body?.plan)));
+
+// Creator: natural-language schema design. A draft is a list of ops; nothing reaches the database before /apply.
+app.post("/api/create/interpret", route((req) => create.interpret(req.body)));
+app.post("/api/create/draft/compile", route((req) => create.compile(req.body)));
+app.post("/api/create/apply", route((req) => create.apply(req.body)));
+app.post("/api/create/database", route((req) => create.createDatabase(req.body)));
+app.post("/api/create/advise", route((req) => create.advise(req.body)));
+app.post("/api/create/seed", route((req) => create.seed(req.body)));
+app.get("/api/create/history", route(() => create.listHistory()));
+app.post("/api/create/undo", route((req) => create.undo(req.body)));
+app.get("/api/create/starters", route(() => create.starters()));
 
 app.listen(PORT, HOST, async () => {
   console.log(`Zynn Explorer → http://localhost:${PORT}`);

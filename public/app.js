@@ -1,6 +1,7 @@
 import { h, api, enc, fmtCompact, mount, errorBox, svg, zynnMark } from "./ui.js";
 import * as pages from "./pages.js";
 import { sqlPage, askPage } from "./query.js";
+import { createPage } from "./create.js";
 
 const root = document.getElementById("app");
 let status = null;
@@ -14,6 +15,7 @@ const lockup = (href) => h(href ? "a.lockup" : "div.lockup", href ? { href } : {
 const ICONS = {
   overview: ["M3 13h8V3H3zM13 21h8V11h-8zM3 21h8v-6H3zM13 3v6h8V3z"],
   ask: ["M21 12a8 8 0 0 1-8 8H4l2.5-3A8 8 0 1 1 21 12z", "M9.5 10a2.5 2.5 0 1 1 3.5 2.3c-.6.3-1 .8-1 1.5", "M12 16.5v.01"],
+  create: ["M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9z", "M19 15v4M17 17h4"],
   sql: ["M5 7l5 5-5 5", "M13 17h6"],
   relationships: ["M4 4h6v6H4zM14 14h6v6h-6z", "M10 7h4a3 3 0 0 1 3 3v4"],
   activity: ["M3 12h4l3-8 4 16 3-8h4"],
@@ -29,7 +31,7 @@ const icon = (name, size = 16) => svg("0 0 24 24", size, ICONS[name].map((d) => 
   { fill: "none", stroke: "currentColor", "stroke-width": "1.75", "stroke-linecap": "round", "stroke-linejoin": "round" });
 
 const NAV = [
-  { label: "Work", items: [["overview", "Overview"], ["ask", "Ask"], ["sql", "SQL"], ["relationships", "Relationships"]] },
+  { label: "Work", items: [["overview", "Overview"], ["ask", "Ask"], ["create", "Create"], ["sql", "SQL"], ["relationships", "Relationships"]] },
   { label: "Server", items: [["activity", "Activity"], ["roles", "Roles"], ["settings", "Settings"], ["databases", "Databases"]] },
 ];
 const PAGE_TITLES = { rel: "Objects", fn: "Objects", sequences: "Objects", types: "Objects" };
@@ -65,15 +67,16 @@ function rememberConnection(c) {
 }
 
 function explainConnectError(err) {
-  const m = err.message ?? "";
-  if (/ECONNREFUSED/.test(m)) return "Nothing is accepting connections at that host and port. Check that Postgres is running and the port is right (Docker containers often map to a port other than 5432).";
+  // The error code is checked as well as the text: some failures arrive with a code and no message.
+  const m = `${err.message ?? ""} ${err.code ?? ""}`.trim();
+  if (/ECONNREFUSED/.test(m)) return "Nothing is accepting connections at that host and port. Check that Postgres is running — for a Docker database, that Docker itself is running — and that the port is right (containers often map to a port other than 5432).";
   if (/ENOTFOUND|EAI_AGAIN/.test(m)) return "That host name could not be resolved.";
   if (/password authentication failed/.test(m)) return "The server rejected that user and password.";
   if (/no password supplied|SASL/.test(m)) return "This server requires a password.";
   if (/does not exist/.test(m)) return m.charAt(0).toUpperCase() + m.slice(1) + ".";
   if (/timeout|ETIMEDOUT/i.test(m)) return "The connection timed out. The host may be unreachable or blocked by a firewall.";
   if (/SSL|TLS/.test(m)) return `${m}. Try toggling "Require SSL".`;
-  return m;
+  return m || "The connection failed, and no reason was given.";
 }
 
 async function connectScreen(message) {
@@ -289,6 +292,10 @@ function route() {
   const views = {
     overview: () => pages.overviewPage(),
     ask: () => askPage(params, status),
+    create: () => createPage(params, status, {
+      onSchemaChanged: async () => { tree = await api("/tree"); shell.side.refresh(); },
+      onDatabaseCreated: async () => { location.hash = "#/create"; await start(); },
+    }),
     sql: () => sqlPage(params),
     rel: () => pages.relationPage(parts[1], parts[2], params.get("tab")),
     fn: () => pages.functionPage(parts[1]),
@@ -298,7 +305,9 @@ function route() {
     settings: () => pages.settingsPage(),
     sequences: () => pages.sequencesPage(),
     types: () => pages.typesPage(tree),
-    databases: () => pages.databasesPage(async (name) => { await api("/switch-database", { database: name }); location.hash = "#/overview"; await start(); }),
+    databases: () => pages.databasesPage(
+      async (name) => { await api("/switch-database", { database: name }); location.hash = "#/overview"; await start(); },
+      async () => { location.hash = "#/create"; await start(); }),
   };
   const view = views[parts[0]] ?? views.overview;
   shell.main.scrollTop = 0;

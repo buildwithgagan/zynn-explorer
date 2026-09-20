@@ -1,7 +1,8 @@
 import {
   h, api, enc, fmtBytes, fmtNum, fmtCompact, fmtTime, KIND_NAMES, codeBlock, resultTable, objectTable,
-  toCsv, download, mount, tabs, errorBox, loading,
+  toCsv, download, mount, tabs, errorBox, loading, promptDialog,
 } from "./ui.js";
+import { erdDiagram } from "./erd.js";
 
 const relHref = (schema, name) => `#/rel/${enc(schema)}/${enc(name)}`;
 const card = (k, v, small) => h("div.card", h("div.k", k), h("div.v", v, small && h("small", " " + small)));
@@ -209,82 +210,20 @@ export async function relationshipsPage(tree) {
   if (!tables.length) return h("div.page", h("div.page-head", h("h1", "Relationships")), h("div.panel.empty", "No foreign keys in this database."));
 
   const details = await Promise.all(tables.slice(0, 40).map((t) => api(`/relation/${enc(t.schema)}/${enc(t.name)}`)));
-  const W = 230, ROW = 17, HEAD = 26, GAP_X = 90, GAP_Y = 36;
-
-  // Layered layout: referenced tables sit to the left of the tables that reference them.
-  const ids = details.map((d) => `${d.schema}.${d.name}`);
-  const depth = new Map(ids.map((id) => [id, 0]));
-  for (let pass = 0; pass < ids.length; pass++) {
-    let moved = false;
-    for (const f of fks) {
-      const from = `${f.schema}.${f.table}`, to = `${f.ref_schema}.${f.ref_table}`;
-      if (from !== to && depth.has(from) && depth.has(to) && depth.get(from) <= depth.get(to) && depth.get(to) < ids.length) {
-        depth.set(from, depth.get(to) + 1);
-        moved = true;
-      }
-    }
-    if (!moved) break;
-  }
-  const layers = [];
-  details.forEach((d) => (layers[depth.get(`${d.schema}.${d.name}`)] ??= []).push(d));
-  const nodes = new Map();
-  let width = 0, height = 0;
-  layers.filter(Boolean).forEach((layer, li) => {
-    let y = 24;
-    for (const d of layer) {
-      const cols = d.columns.slice(0, 14);
-      const hgt = HEAD + cols.length * ROW + 8 + (d.columns.length > cols.length ? ROW : 0);
-      nodes.set(`${d.schema}.${d.name}`, { d, cols, x: 24 + li * (W + GAP_X), y, h: hgt });
-      y += hgt + GAP_Y;
-    }
-    width = Math.max(width, 24 + (li + 1) * (W + GAP_X));
-    height = Math.max(height, y);
-  });
-
-  const NS = "http://www.w3.org/2000/svg";
-  const s = (tag, attrs = {}, ...kids) => {
-    const el = document.createElementNS(NS, tag);
-    for (const [k, v] of Object.entries(attrs)) el.setAttribute(k, v);
-    el.append(...kids);
-    return el;
-  };
-  const svg = s("svg", { width, height, viewBox: `0 0 ${width} ${height}` });
-  const rowY = (node, col) => {
-    const i = node.cols.findIndex((c) => c.name === col);
-    return node.y + HEAD + (i < 0 ? node.cols.length : i) * ROW + ROW / 2 + 2;
-  };
-  const edges = [];
-  for (const f of fks) {
-    const a = nodes.get(`${f.schema}.${f.table}`), b = nodes.get(`${f.ref_schema}.${f.ref_table}`);
-    if (!a || !b) continue;
-    const y1 = rowY(a, f.columns[0]), y2 = rowY(b, f.ref_columns[0]);
-    const leftward = b.x < a.x;
-    const x1 = leftward ? a.x : a.x + W, x2 = leftward ? b.x + W : b.x + W;
-    const bend = leftward ? -GAP_X / 2 : GAP_X / 2;
-    const path = s("path", { class: "erd-edge", d: `M${x1},${y1} C${x1 + bend},${y1} ${x2 + Math.abs(bend)},${y2} ${x2},${y2}` });
-    path.append(s("title", {}, `${f.table}.${f.columns.join(",")} → ${f.ref_table}.${f.ref_columns.join(",")}`));
-    edges.push({ path, from: `${f.schema}.${f.table}`, to: `${f.ref_schema}.${f.ref_table}` });
-    svg.append(path);
-  }
-  for (const [id, n] of nodes) {
-    const g = s("g", { class: "erd-node", transform: `translate(${n.x},${n.y})` },
-      s("rect", { class: "box", width: W, height: n.h, rx: 6 }),
-      s("rect", { class: "head", x: 1, y: 1, width: W - 2, height: HEAD - 2, rx: 5 }),
-      s("text", { class: "title", x: 10, y: 17 }, n.d.name));
-    n.cols.forEach((c, i) => {
-      const y = HEAD + i * ROW + ROW - 3;
-      g.append(s("text", { x: 10, y, class: c.is_pk ? "key" : c.references ? "" : "" }, (c.is_pk ? "⚷ " : c.references ? "→ " : "  ") + c.name),
-        s("text", { class: "type", x: W - 10, y, "text-anchor": "end" }, c.type.length > 16 ? c.type.slice(0, 15) + "…" : c.type));
-    });
-    if (n.d.columns.length > n.cols.length) g.append(s("text", { class: "type", x: 10, y: HEAD + n.cols.length * ROW + ROW - 3 }, `+ ${n.d.columns.length - n.cols.length} more`));
-    g.addEventListener("mouseenter", () => edges.forEach((e) => e.path.classList.toggle("hot", e.from === id || e.to === id)));
-    g.addEventListener("mouseleave", () => edges.forEach((e) => e.path.classList.remove("hot")));
-    g.addEventListener("click", () => (location.hash = relHref(n.d.schema, n.d.name)));
-    svg.append(g);
-  }
+  const svg = erdDiagram({
+    tables: details.map((d) => ({
+      id: `${d.schema}.${d.name}`, name: d.name, schema: d.schema,
+      columns: d.columns.map((c) => ({ name: c.name, type: c.type, isPk: c.is_pk, isFk: Boolean(c.references) })),
+    })),
+    edges: fks.map((f) => ({
+      from: `${f.schema}.${f.table}`, to: `${f.ref_schema}.${f.ref_table}`, fromCol: f.columns[0], toCol: f.ref_columns[0],
+      title: `${f.table}.${f.columns.join(",")} → ${f.ref_table}.${f.ref_columns.join(",")}`,
+    })),
+  }, { onClick: (t) => (location.hash = relHref(t.schema, t.name)) });
+  const nodes = details;
 
   return h("div.page", { style: "max-width:none" },
-    h("div.page-head", h("h1", "Relationships"), h("span.sub", `${fks.length} foreign keys · ${nodes.size} tables`)),
+    h("div.page-head", h("h1", "Relationships"), h("span.sub", `${fks.length} foreign keys · ${nodes.length} tables`)),
     tabs([
       { id: "diagram", label: "Diagram", render: () => h("div.erd-wrap", svg) },
       { id: "list", label: "Foreign keys", count: fks.length, render: () => objectTable(fks, [
@@ -380,15 +319,25 @@ export async function typesPage(tree) {
     ], { empty: "No user-defined types." }));
 }
 
-export async function databasesPage(onSwitch) {
+export async function databasesPage(onSwitch, onCreated) {
   const dbs = await api("/databases");
   const feedback = h("div");
+  const create = async () => {
+    const name = await promptDialog({
+      title: "New database", label: "Name", confirmLabel: "Create and open", placeholder: "my_app",
+      body: "Created on this server with your current role, then opened. Use lowercase letters, digits and underscores.",
+    });
+    if (!name) return;
+    feedback.replaceChildren();
+    try { await api("/create/database", { name }); await onCreated(name); } catch (err) { feedback.replaceChildren(errorBox(err)); }
+  };
   const open = (d) => async (e) => {
     e.target.disabled = true;
     feedback.replaceChildren();
     try { await onSwitch(d.name); } catch (err) { feedback.replaceChildren(errorBox(err)); e.target.disabled = false; }
   };
-  return h("div.page", h("div.page-head", h("h1", "Databases"), h("span.sub", "on this server · switching reuses your current credentials")),
+  return h("div.page", h("div.page-head", h("h1", "Databases"), h("span.sub", "on this server · switching reuses your current credentials"),
+    h("span.spacer"), onCreated && h("button.btn.primary", { onclick: create }, "New database")),
     feedback,
     objectTable(dbs, [
       { label: "Database", render: (d) => h("span.mono", d.name, " ", d.current && h("span.badge.accent", "connected")) },

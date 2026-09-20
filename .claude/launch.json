@@ -6,6 +6,12 @@
       "runtimeExecutable": "npm",
       "runtimeArgs": ["start"],
       "port": 4477
+    },
+    {
+      "name": "postgres-explorer-4478",
+      "runtimeExecutable": "sh",
+      "runtimeArgs": ["-c", "PORT=4478 exec node --env-file-if-exists=.env server/index.js"],
+      "port": 4478
     }
   ]
 }

@@ -173,3 +173,96 @@ export function resolveWindow(windowKey, { year, month } = {}, now = new Date())
   }
   return { from: iso(range[0]), to: iso(range[1]) };
 }
+
+// ---------------------------------------------------------------------------
+// Creator: names for new things. Jev cannot invent an identifier, so every table, column, role or
+// database name it can choose is a phrase taken from the request and normalised here.
+// ---------------------------------------------------------------------------
+const CREATOR_STOPWORDS = new Set(`a an the in on at to for from by with without and or not no is are was were be been it its this that these those
+i we my our us you your please want need would like can could should will let lets make makes create creates add adds adding new build set up
+give put include including also plus then so into onto each every all some any has have having where which that whose as per
+table tables column columns field fields attribute attributes property properties database db schema called named me them they
+store stores storing track tracks tracking keep keeps hold holds record records contain contains containing
+change rename drop remove delete alter modify update make required optional unique index indexed mandatory nullable
+role roles user grant revoke access permission permissions read write only allow allowed
+rows row sample fake dummy test data fill seed populate generate insert
+should must need needs there their one many belongs belong between link linked relate related relation relationship reference references
+type kind instead rather just but too well system app application simple basic full complete proper`.split(/\s+/));
+
+const IRREGULAR = { person: "people", child: "children", man: "men", woman: "women", mouse: "mice", foot: "feet", tooth: "teeth", goose: "geese" };
+const UNCOUNTABLE = new Set(["staff", "media", "data", "news", "series", "equipment", "information", "inventory", "stock", "feedback", "software", "hardware"]);
+
+export function pluralize(word) {
+  if (UNCOUNTABLE.has(word) || Object.values(IRREGULAR).includes(word)) return word;
+  if (IRREGULAR[word]) return IRREGULAR[word];
+  if (/[^aeiou]y$/.test(word)) return word.slice(0, -1) + "ies";
+  if (/(s|x|z|ch|sh)$/.test(word)) return /(ies|[^s]s)$/.test(word) && !/(ss|us|is)$/.test(word) ? word : word + "es";
+  return word + "s";
+}
+
+export function singularize(word) {
+  for (const [one, many] of Object.entries(IRREGULAR)) if (word === many) return one;
+  if (UNCOUNTABLE.has(word) || /(ss|us|is)$/.test(word)) return word;
+  if (/ies$/.test(word)) return word.slice(0, -3) + "y";
+  if (/(ch|sh|x|z|ss|us)es$/.test(word)) return word.slice(0, -2);
+  return word.replace(/s$/, "");
+}
+
+/** "Date of Birth" → date_of_birth. Returns "" when nothing usable is left. */
+export function toSnake(text) {
+  return String(text).normalize("NFKD").replace(/[̀-ͯ]/g, "")
+    .replace(/([a-z0-9])([A-Z])/g, "$1_$2").toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "").replace(/^(\d)/, "_$1").slice(0, 63);
+}
+
+/** A table name by convention: snake_case, last word plural ("order item" → order_items). */
+export function tableIdent(text) {
+  const parts = toSnake(text).split("_").filter(Boolean);
+  if (!parts.length) return "";
+  parts.push(pluralize(parts.pop()));
+  return parts.join("_");
+}
+
+/**
+ * Phrases in the request that could be the name of something: quoted strings, then 1–3 word n-grams
+ * of words that are not filler. → [{ text, ident, run, start, end }], longest phrases of each run first.
+ * `run`/`start`/`end` let the caller drop "first" and "name" once "first name" has been accepted.
+ */
+export function identCandidates(request, max = 24) {
+  const out = [];
+  const add = (text, run, start, end) => {
+    const ident = toSnake(text);
+    if (ident.length < 2 || out.length >= max || out.some((o) => o.ident === ident)) return;
+    out.push({ text, ident, run, start, end });
+  };
+  let rest = request;
+  let run = 0;
+  for (const m of request.matchAll(/"([^"]{1,60})"|'([^']{1,60})'|“([^”]{1,60})”|`([^`]{1,60})`/g)) {
+    add(m[1] ?? m[2] ?? m[3] ?? m[4], run++, 0, 1);
+    rest = rest.replace(m[0], " | ");
+  }
+  const runs = [];
+  let words = [];
+  const close = () => { while (words.at(-1) === "of") words.pop(); if (words.length) runs.push(words); words = []; };
+  for (const token of rest.split(/(\s+|[|,;:!?()./]+)/)) {
+    if (!token || /^\s+$/.test(token)) continue;
+    const word = token.replace(/^[^\w]+|[^\w]+$/g, "").replace(/'s$/, "");
+    const lower = word.toLowerCase();
+    if (!word || /^[|,;:!?()./]+$/.test(token) || /^\d+$/.test(word) || lower in NUMBER_WORDS) close();
+    else if (lower === "of") { if (words.length) words.push("of"); }
+    else if (CREATOR_STOPWORDS.has(lower)) close();
+    else words.push(word);
+  }
+  close();
+  for (const list of runs) {
+    for (let size = Math.min(3, list.length); size >= 1; size--) {
+      for (let i = 0; i + size <= list.length; i++) {
+        const slice = list.slice(i, i + size);
+        if (slice[0] === "of" || slice.at(-1) === "of") continue;
+        add(slice.join(" "), run, i, i + size);
+      }
+    }
+    run++;
+  }
+  return out;
+}

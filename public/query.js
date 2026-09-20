@@ -1,9 +1,5 @@
 import { h, api, enc, fmtNum, codeBlock, resultTable, toCsv, download, errorBox, loading, zynnMark, lineIcon } from "./ui.js";
-
-const store = {
-  get(key, fallback) { try { return JSON.parse(localStorage.getItem(key)) ?? fallback; } catch { return fallback; } },
-  set(key, value) { try { localStorage.setItem(key, JSON.stringify(value)); } catch { /* private mode */ } },
-};
+import { store, pct, SEND_ICON, judgmentCard } from "./chat.js";
 
 function resultView(result, name = "result") {
   return h("div",
@@ -62,18 +58,6 @@ export function sqlPage(params) {
 // ---------------------------------------------------------------- Ask (Jev)
 const INTENT_LABELS = { rows: "list of rows", count: "count", aggregate: "single number", breakdown: "breakdown by group", share: "percentage" };
 const OP_LABELS = { eq: "=", neq: "≠", gt: ">", gte: "≥", lt: "<", lte: "≤", contains: "contains", is_null: "is empty", not_null: "has a value", in: "is one of", not_in: "is none of", not_contains: "does not contain" };
-const pct = (p) => `${Math.round(p * 100)}%`;
-
-function judgmentCard(j, onOverride) {
-  const level = j.p >= 0.8 ? "" : j.p >= 0.55 ? "mid" : "low";
-  return h(`div.judgment${j.applied ? "" : ".unused"}`,
-    h("div.top", h("span.title", j.title), h("span.value", { title: j.value }, j.value ?? "—"),
-      h("span.p", { title: "Probability Jev assigned to this answer" }, j.applied ? pct(j.p) : `${pct(j.p)} · not applied`)),
-    h("div.meter", h(`i${level ? "." + level : ""}`, { style: `width:${pct(j.p)}` })),
-    j.alternatives?.length ? h("div.alts", j.alternatives.map((a) => j.overridable
-      ? h("button", { title: "Re-plan with this table", onclick: () => onOverride(a.value) }, `${a.label} ${pct(a.p)}`)
-      : h("span", `${a.label} ${pct(a.p)}`))) : null);
-}
 
 function planEditor(data, onChange) {
   const { plan, editor } = data;
@@ -144,7 +128,6 @@ function saveThread(key, thread) {
   catch { try { localStorage.setItem(THREAD_KEY(key), JSON.stringify(slim.slice(-8))); } catch { /* storage full or unavailable */ } }
 }
 
-const SEND_ICON = ["M12 19V5", "M5 12l7-7 7 7"];
 const relHref = (r) => `#/rel/${enc(r.schema)}/${enc(r.name)}`;
 
 /** The body of one assistant turn. Re-rendered in place when the plan is edited. */
