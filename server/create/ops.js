@@ -50,6 +50,8 @@ const SHAPES = {
     table: str(r.table), columns: strList(r.columns, 8), refTable: str(r.refTable), refColumns: r.refColumns ? strList(r.refColumns, 8) : undefined,
     onDelete: oneOf(r.onDelete, Object.keys(ON_DELETE), "restrict"), index: bool(r.index, true),
   }),
+  // Postgres cannot alter a foreign key's action in place: the constraint is dropped and re-added in one statement.
+  set_fk_action: (r) => ({ table: str(r.table), name: str(r.name), onDelete: oneOf(r.onDelete, Object.keys(ON_DELETE), "restrict") }),
   add_unique: (r) => ({ table: str(r.table), columns: strList(r.columns, 8) }),
   add_check: (r) => ({ table: str(r.table), column: str(r.column), template: oneOf(r.template, Object.keys(CHECKS), undefined) }),
   drop_constraint: (r) => ({ table: str(r.table), name: str(r.name) }),

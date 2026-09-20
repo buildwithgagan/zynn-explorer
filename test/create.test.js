@@ -9,7 +9,7 @@ import { generateRows } from "../server/create/seed.js";
 import { mulberry32, inferArchetype } from "../server/create/archetypes.js";
 import { parseCatalogType, parseCatalogDefault, isSafeWidening } from "../server/create/types.js";
 import { describeOp, summarizeOps } from "../server/create/wording.js";
-import { identCandidates, tableIdent, toSnake, singularize } from "../server/nl/candidates.js";
+import { identCandidates, tableIdent, toSnake, singularize, valueLists } from "../server/nl/candidates.js";
 
 const T = (base, ...args) => (args.length ? { base, args } : { base });
 const table = (name, columns, extra = {}) => ({ kind: "create_table", name, columns, ...extra });
@@ -136,6 +136,31 @@ test("undo: replaying the inverse ops returns the design to where it started", (
   assert.equal(fingerprint(back.draft), fingerprint(base));
 });
 
+test("a link's delete rule can be changed, and changed back", () => {
+  const base = build(SHOP).draft;
+  const name = "orders_customer_id_fkey";
+  const r = build([{ kind: "set_fk_action", table: "public.orders", name, onDelete: "restrict" }], base);
+  assert.deepEqual(r.broken, []);
+  assert.equal(r.statements[0].sql, `ALTER TABLE "public"."orders"\n  DROP CONSTRAINT "${name}",\n  ADD CONSTRAINT "${name}" FOREIGN KEY ("customer_id") REFERENCES "public"."customers" ("id") ON DELETE RESTRICT;`);
+  assert.equal(fingerprint(build(r.inverse, r.draft).draft), fingerprint(base));
+  assert.match(build([{ kind: "set_fk_action", table: "public.orders", name, onDelete: "cascade" }], base).broken[0].reason, /already deletes/);
+  // Clearing a link needs a column that may be empty.
+  assert.match(build([{ kind: "set_fk_action", table: "public.orders", name, onDelete: "set_null" }], base).broken[0].reason, /Make it optional first/);
+  const cleared = build([{ kind: "drop_not_null", table: "public.orders", column: "customer_id" }, { kind: "set_fk_action", table: "public.orders", name, onDelete: "set_null" }], base);
+  assert.deepEqual(cleared.broken, []);
+  assert.match(cleared.statements.at(-1).sql, /ON DELETE SET NULL;$/);
+  assert.equal(cleanOp({ kind: "set_fk_action", table: "t", name: "x", onDelete: "CASCADE; drop table y" }).onDelete, "restrict");
+});
+
+test("a combination of columns can be unique, and a default can be set", () => {
+  const base = build(SHOP).draft;
+  const r = build([{ kind: "add_unique", table: "public.orders", columns: ["customer_id", "total"] }, { kind: "set_default", table: "public.orders", column: "total", default: { kind: "number", value: 0 } }], base);
+  assert.deepEqual(r.broken, []);
+  assert.equal(r.statements[0].sql, 'ALTER TABLE "public"."orders" ADD CONSTRAINT "orders_customer_id_total_key" UNIQUE ("customer_id", "total");');
+  assert.equal(r.statements[1].sql, 'ALTER TABLE "public"."orders" ALTER COLUMN "total" SET DEFAULT 0;');
+  assert.equal(describeOp(cleanOp({ kind: "add_unique", table: "public.orders", columns: ["customer_id", "total"] })), "Allow each combination of customer_id + total only once in orders");
+});
+
 test("an enum value added in a draft cannot be used until it is applied", () => {
   const base = build([{ kind: "create_enum", name: "mood", values: ["ok"] }, table("t", [{ name: "m", type: { enum: "public.mood" } }])]).draft;
   const r = build([{ kind: "add_enum_value", enum: "public.mood", value: "great" }, { kind: "set_default", table: "public.t", column: "m", default: { kind: "enum_label", value: "great" } }], base);
@@ -208,6 +233,10 @@ test("sample data respects foreign keys, uniqueness, checks and enums, and is re
   assert.throws(() => generateRows(design, "public.orders", 5, mulberry32(1), {}), /customers has no rows/);
   assert.equal(inferArchetype({ name: "email", type: T("text") }), "email");
   assert.equal(inferArchetype({ name: "email", type: T("integer") }), "count");
+  assert.equal(inferArchetype({ name: "password_hash", type: T("text") }), "password_hash");
+  assert.equal(inferArchetype({ name: "token_hash", type: T("text") }), "secret_hash");
+  assert.equal(inferArchetype({ name: "ip_address", type: T("inet") }), "ip_address");
+  assert.ok(identCandidates("create a roles table and a permissions table for users").map((c) => c.ident).includes("roles"));
 });
 
 test("the advisor finds what a DBA would, and each fix compiles", () => {
@@ -256,9 +285,15 @@ test("catalog types and defaults round-trip into the design's vocabulary", () =>
 
 test("names come from the request: phrases become identifiers by rule", () => {
   const idents = (r) => identCandidates(r).map((c) => c.ident);
-  assert.deepEqual(idents("create a table called invoices with number, amount, due date and status"), ["invoices", "number", "amount", "due_date", "due", "date", "status"]);
+  assert.deepEqual(idents("create a table called invoices with number, amount, due date and status"), ["invoices", "number", "amount", "due_date", "status", "due", "date"]);
   assert.ok(idents("add first name and date of birth to patients").includes("date_of_birth"));
+  // "at" closes a name, "full" is not filler, and whole phrases come before their fragments.
+  assert.deepEqual(idents("users with full name, email verified at and last login at").slice(0, 4), ["users", "full_name", "email_verified_at", "last_login_at"]);
   assert.deepEqual(idents('add a column "Order Ref" to orders').slice(0, 1), ["order_ref"]);
+  // A bracketed list after a name is that field's allowed values, multi-word values included.
+  assert.deepEqual(valueLists("tokens with purpose (email verification, password reset) and status (a, b or c)").map((l) => [l.fields.at(-1), l.values]),
+    [["purpose", ["email_verification", "password_reset"]], ["status", ["a", "b", "c"]]]);
+  assert.deepEqual(valueLists("add notes (optional) to users"), []);
   assert.equal(tableIdent("order item"), "order_items");
   assert.equal(tableIdent("Category"), "categories");
   assert.equal(tableIdent("staff"), "staff");

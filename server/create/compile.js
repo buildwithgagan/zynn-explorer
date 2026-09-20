@@ -339,6 +339,23 @@ const STEPS = {
     return inverse;
   },
 
+  set_fk_action(d, op, out) {
+    const t = getTable(d, op.table);
+    const fk = t.fks.find((f) => f.name === op.name);
+    if (!fk) throw new OpError(`${t.name} has no link named "${String(op.name).slice(0, 60)}"`);
+    const parent = getTable(d, fk.refTable);
+    if (fk.onDelete === op.onDelete) throw new OpError(`Deleting a ${parent.name} row already ${op.onDelete === "cascade" ? "deletes" : op.onDelete === "set_null" ? "clears the link on" : "is blocked by"} its ${t.name}`);
+    if (op.onDelete === "set_null" && fk.columns.some((c) => !getColumn(t, c).nullable)) throw new OpError(`${t.name}.${fk.columns.join(", ")} is required, so the link cannot be cleared. Make it optional first`);
+    const previous = fk.onDelete;
+    fk.onDelete = op.onDelete;
+    const effect = { cascade: `Deleting a ${parent.name} row will now delete its ${t.name} rows too`, set_null: `Deleting a ${parent.name} row will now keep its ${t.name} rows and clear their link`, restrict: `A ${parent.name} row can no longer be deleted while ${t.name} rows point at it`, no_action: `A ${parent.name} row can no longer be deleted while ${t.name} rows point at it` }[op.onDelete];
+    out.push({
+      sql: `ALTER TABLE ${tableSql(t)}\n  DROP CONSTRAINT ${quoteIdent(fk.name)},\n  ADD ${fkSql(d, fk)};`,
+      level: t.estRows === 0 && op.onDelete !== "cascade" ? "safe" : "caution", reason: `${effect}. The link is re-checked against existing rows`,
+    });
+    return ["restrict", "cascade", "set_null", "no_action"].includes(previous) ? [{ kind: "set_fk_action", table: op.table, name: op.name, onDelete: previous }] : null;
+  },
+
   add_unique(d, op, out) {
     const t = getTable(d, op.table);
     if (!op.columns.length) throw new OpError("Pick at least one column");

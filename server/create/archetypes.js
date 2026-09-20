@@ -50,20 +50,26 @@ export const ARCHETYPES = {
   duration: { describe: "A length of time. Examples: duration, length of a visit, time spent.", column: { type: T("interval") }, gen: (r) => `${int(r, 5, 180)} minutes` },
   json_data: { describe: "Free-form structured data. Examples: metadata, settings, preferences, attributes, payload, extra data.", column: { type: T("jsonb"), nullable: false, default: { kind: "empty_json" } }, gen: (r) => JSON.stringify({ source: pick(r, ["web", "import", "api"]), rank: int(r, 1, 9) }) },
   uuid_token: { describe: "A random unique token or public identifier. Examples: token, api key, public id, uuid.", column: { type: T("uuid"), nullable: false, unique: true, default: { kind: "uuid" } }, gen: (r) => `${hex(r, 8)}-${hex(r, 4)}-4${hex(r, 3)}-a${hex(r, 3)}-${hex(r, 12)}` },
+  external_ref: { describe: "The identifier something has in another system. Examples: provider user id, stripe customer id, github id.", column: { type: T("text") }, gen: (r, i) => `ext_${hex(r, 10)}${i + 1}` },
   external_id: { describe: "An identifier that comes from another system. Examples: external id, stripe id, reference number, order number, invoice number.", column: { type: T("text"), unique: true }, gen: (r, i) => `REF-${pad(i + 1, 5)}-${hex(r, 4).toUpperCase()}` },
+  password_hash: { describe: "A hashed password. Never the password itself.", column: { type: T("text"), nullable: false }, gen: (r) => `$argon2id$v=19$m=65536,t=3,p=4$${hex(r, 22)}$${hex(r, 43)}` },
+  secret_hash: { describe: "The hash of a secret token, such as a session token, reset token or API key. Examples: token hash, key hash, secret hash.", column: { type: T("text"), nullable: false, unique: true }, gen: (r) => hex(r, 64) },
+  ip_address: { describe: "An IP address.", column: { type: T("inet") }, gen: (r) => `10.${int(r, 0, 255)}.${int(r, 0, 255)}.${int(r, 1, 254)}` },
   color: { describe: "A colour.", column: { type: T("text") }, gen: (r) => pick(r, COLORS) },
   plain_text: { describe: "Some other short piece of text that fits none of the other descriptions.", column: { type: T("text") }, gen: (r) => `${pick(r, ADJECTIVES)} ${pick(r, NOUNS)}`.toLowerCase() },
 };
 
 // A name that settles the question on its own is decided here, not asked: a checkable rule belongs in code.
 const NAME_RULES = [
+  [/(^|_)(password|passwd|pass)(_hash|_digest)?$/, "password_hash"], [/(^|_)(token|secret|key|code)_(hash|digest)$/, "secret_hash"],
+  [/(^|_)ip(_address|_addr)?$/, "ip_address"], [/^user_agent$/, "long_text"],
   [/(^|_)e?mail$/, "email"], [/(^|_)(phone|mobile|tel)(_number)?$/, "phone"], [/(_at|_time|timestamp)$/, "timestamp"],
   [/^(is|has|can|was)_/, "boolean_flag"], [/(^|_)(price|amount|total|cost|fee|salary|balance|subtotal|budget)$/, "money"],
   [/(^|_)(url|website|link)$/, "url"], [/^(first|given)_name$/, "first_name"], [/^(last|family)_name$|^surname$/, "last_name"],
   [/(^|_)(quantity|qty|stock)$/, "quantity"], [/(^|_)(description|notes?|body|content|bio|summary)$/, "long_text"],
   [/^slug$|^handle$/, "slug"], [/(_date|^date|^birthday|^dob)$/, "date"], [/^(zip|zip_code|postal_code|postcode)$/, "postal_code"],
   [/^(status|state|stage)$/, "status"], [/^(metadata|settings|preferences|payload)$/, "json_data"], [/^rating$|^stars$/, "rating"],
-  [/^country$/, "country"], [/^city$/, "city"], [/^(address|street)(_line)?\d?$/, "address_line"],
+  [/^(name|title|label)$/, "title"], [/^country$/, "country"], [/_id$/, "external_ref"], [/^city$/, "city"], [/^(address|street)(_line)?\d?$/, "address_line"],
 ];
 
 export function archetypeByName(name) {
@@ -74,7 +80,7 @@ export function archetypeByName(name) {
 const BY_TYPE = {
   text: "plain_text", varchar: "plain_text", smallint: "count", integer: "count", bigint: "count", numeric: "decimal_number", real: "decimal_number",
   "double precision": "decimal_number", boolean: "boolean_flag", date: "date", timestamp: "timestamp", timestamptz: "timestamp", interval: "duration",
-  uuid: "uuid_token", json: "json_data", jsonb: "json_data",
+  uuid: "uuid_token", json: "json_data", jsonb: "json_data", inet: "ip_address",
 };
 
 /** The archetype of a column that already exists, judged from its name and then its type. Null when Creator cannot fill it. */

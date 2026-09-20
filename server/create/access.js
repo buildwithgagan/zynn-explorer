@@ -20,7 +20,9 @@ const PRIVILEGE_MEANING = {
 
 export async function interpretAccess({ reading, request, state, draft, tables, schema, spans, targetTable, mentioned, ops, done, decline }) {
   const existingRoles = Object.keys(draft.roles).filter((r) => !/^pg_/.test(r)).slice(0, 80);
-  const newRoles = spans.roles.map((s) => safeName(s.ident)).filter((r) => !existingRoles.includes(r));
+  // "the support role" names the role support: a trailing generic word, spoken as a separate word, is not part of the name.
+  const roleIdent = (s) => (/\s(role|user|group|account)$/i.test(s.text) ? s.ident.replace(/_(role|user|group|account)$/, "") : s.ident);
+  const newRoles = [...new Set(spans.roles.map((s) => safeName(roleIdent(s))))].filter((r) => r && !existingRoles.includes(r));
   const roleOptions = { ...Object.fromEntries(existingRoles.map((r) => [r, `The existing role ${r}`])), ...Object.fromEntries(newRoles.map((r) => [r, `A role called ${r}, named in the request`])) };
 
   const q = {
