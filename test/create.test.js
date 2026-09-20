@@ -7,7 +7,7 @@ import { BLUEPRINTS, instantiate } from "../server/create/blueprints/index.js";
 import { advise } from "../server/create/advisor.js";
 import { generateRows } from "../server/create/seed.js";
 import { mulberry32, inferArchetype } from "../server/create/archetypes.js";
-import { parseCatalogType, parseCatalogDefault, isSafeWidening } from "../server/create/types.js";
+import { parseCatalogType, parseCatalogDefault, parseCatalogGenerated, isSafeWidening, cleanDefault } from "../server/create/types.js";
 import { describeOp, summarizeOps } from "../server/create/wording.js";
 import { identCandidates, tableIdent, toSnake, singularize, valueLists } from "../server/nl/candidates.js";
 
@@ -159,6 +159,62 @@ test("a combination of columns can be unique, and a default can be set", () => {
   assert.equal(r.statements[0].sql, 'ALTER TABLE "public"."orders" ADD CONSTRAINT "orders_customer_id_total_key" UNIQUE ("customer_id", "total");');
   assert.equal(r.statements[1].sql, 'ALTER TABLE "public"."orders" ALTER COLUMN "total" SET DEFAULT 0;');
   assert.equal(describeOp(cleanOp({ kind: "add_unique", table: "public.orders", columns: ["customer_id", "total"] })), "Allow each combination of customer_id + total only once in orders");
+});
+
+test("a calculated column is a template over real columns, never an expression", () => {
+  const base = build([table("order_items", [{ name: "quantity", type: T("integer"), nullable: false }, { name: "unit_price", type: T("numeric", 12, 2), nullable: false }, { name: "note", type: T("text") }, { name: "starts_at", type: T("timestamptz") }, { name: "ends_at", type: T("timestamptz") }])]).draft;
+  const gen = (name, template, columns) => ({ kind: "add_generated_column", table: "public.order_items", name, template, columns });
+  const r = build([gen("line_total", "multiply", ["quantity", "unit_price"]), gen("duration", "subtract", ["ends_at", "starts_at"]), gen("note_lower", "lower", ["note"])], base);
+  assert.deepEqual(r.broken, []);
+  assert.equal(r.statements[0].sql, 'ALTER TABLE "public"."order_items" ADD COLUMN "line_total" numeric GENERATED ALWAYS AS ("quantity" * "unit_price") STORED;');
+  assert.match(r.statements[1].sql, /"duration" interval GENERATED ALWAYS AS \("ends_at" - "starts_at"\) STORED;$/);
+  assert.match(r.statements[2].sql, /"note_lower" text GENERATED ALWAYS AS \(lower\("note"\)\) STORED;$/);
+  assert.equal(fingerprint(build(r.inverse, r.draft).draft), fingerprint(base));
+  // Types that do not fit, unknown templates, and SQL smuggled in as a template or a column are all refused.
+  assert.match(build([gen("x", "multiply", ["quantity", "note"])], base).broken[0].reason, /cannot be combined/);
+  assert.equal(cleanOp(gen("x", "quantity); drop table y; --", ["quantity"])).template, undefined);
+  assert.match(build([gen("x", "nope", ["quantity"])], base).broken[0].reason, /not one Creator can write/);
+  assert.match(build([gen("x", "lower", ['note"); drop table y; --'])], base).broken[0].reason, /has no column/);
+  // A column that feeds a calculation cannot be dropped or retyped from under it; a rename follows through.
+  assert.match(build([{ kind: "drop_column", table: "public.order_items", column: "quantity" }], r.draft).broken[0].reason, /line_total is calculated from quantity/);
+  assert.match(build([{ kind: "alter_column_type", table: "public.order_items", column: "quantity", type: T("bigint") }], r.draft).broken[0].reason, /calculated from quantity/);
+  const renamed = build([{ kind: "rename_column", table: "public.order_items", column: "quantity", name: "qty" }], r.draft).draft;
+  assert.deepEqual(renamed.tables["public.order_items"].columns.find((c) => c.name === "line_total").generatedAs.columns, ["qty", "unit_price"]);
+  // Sample data leaves calculated columns to Postgres.
+  assert.ok(!generateRows(r.draft, "public.order_items", 3, mulberry32(1), {}).columns.includes("line_total"));
+  assert.equal(describeOp(cleanOp(gen("line_total", "multiply", ["quantity", "unit_price"]))), "Add line_total to order_items, always quantity × unit_price");
+});
+
+test("calculated columns read from the catalog are matched back to their template", () => {
+  const cols = ["quantity", "unit_price", "first_name", "last_name", "email", "expires_at", "created_at"];
+  assert.deepEqual(parseCatalogGenerated("((quantity)::numeric * unit_price)", cols), null); // a cast Create did not write: left opaque
+  assert.deepEqual(parseCatalogGenerated("(quantity * unit_price)", cols), { template: "multiply", columns: ["quantity", "unit_price"] });
+  assert.deepEqual(parseCatalogGenerated("(expires_at - created_at)", cols), { template: "subtract", columns: ["expires_at", "created_at"] });
+  assert.deepEqual(parseCatalogGenerated("((first_name || ' '::text) || last_name)", cols), { template: "concat", columns: ["first_name", "last_name"] });
+  assert.deepEqual(parseCatalogGenerated("lower(email)", cols), { template: "lower", columns: ["email"] });
+  assert.equal(parseCatalogGenerated("(quantity * missing)", cols), null);
+  assert.equal(parseCatalogGenerated("(quantity * unit_price) + 1", cols), null);
+});
+
+test("a default can be a time from now", () => {
+  const base = build([table("tokens", [{ name: "expires_at", type: T("timestamptz") }, { name: "label", type: T("text") }])]).draft;
+  const set = (column, d) => ({ kind: "set_default", table: "public.tokens", column, default: d });
+  assert.equal(build([set("expires_at", { kind: "now_plus", amount: 30, unit: "days" })], base).statements[0].sql, `ALTER TABLE "public"."tokens" ALTER COLUMN "expires_at" SET DEFAULT now() + interval '30 days';`);
+  assert.match(build([set("label", { kind: "now_plus", amount: 30, unit: "days" })], base).broken[0].reason, /cannot hold a moment in time/);
+  assert.throws(() => cleanDefault({ kind: "now_plus", amount: 30, unit: "days'; drop table x; --" }), /unit must be/);
+  assert.throws(() => cleanDefault({ kind: "now_plus", amount: "1; drop", unit: "days" }), /whole number/);
+  assert.deepEqual(parseCatalogDefault("(now() + '30 days'::interval)"), { kind: "now_plus", amount: 30, unit: "days" });
+  assert.deepEqual(parseCatalogDefault("(now() + '1 mon'::interval)"), { kind: "now_plus", amount: 1, unit: "months" });
+});
+
+test("removing a combination rule can be undone, and a rule in use cannot be removed", () => {
+  const base = build([...SHOP, { kind: "add_unique", table: "public.orders", columns: ["customer_id", "total"] }]).draft;
+  const r = build([{ kind: "drop_constraint", table: "public.orders", name: "orders_customer_id_total_key" }, { kind: "add_unique", table: "public.orders", columns: ["customer_id", "total", "id"] }], base);
+  assert.deepEqual(r.broken, []);
+  assert.deepEqual(r.draft.tables["public.orders"].uniques.map((u) => u.columns.join("+")), ["customer_id+total+id"]);
+  assert.equal(fingerprint(build(r.inverse, r.draft).draft), fingerprint(base));
+  const linked = build([table("a", [{ name: "code", type: T("text"), nullable: false, unique: true }]), table("b", [{ name: "a_code", type: T("text") }]), { kind: "add_fk", table: "public.b", columns: ["a_code"], refTable: "public.a", refColumns: ["code"] }]).draft;
+  assert.match(build([{ kind: "drop_constraint", table: "public.a", name: "a_code_key" }], linked).broken[0].reason, /b references these columns/);
 });
 
 test("an enum value added in a draft cannot be used until it is applied", () => {

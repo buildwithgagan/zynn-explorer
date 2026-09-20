@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { cleanType, cleanDefault, CHECKS, ON_DELETE, PRIVILEGES, POLICY_COMMANDS, POLICY_TEMPLATES } from "./types.js";
+import { cleanType, cleanDefault, CHECKS, ON_DELETE, PRIVILEGES, POLICY_COMMANDS, POLICY_TEMPLATES, GENERATED } from "./types.js";
 
 // An op is one staged change. Ops arrive from the browser, so every one is rebuilt here field by field:
 // what is not listed for its kind is dropped, and what is listed is coerced to a known shape.
@@ -38,6 +38,8 @@ const SHAPES = {
   drop_table: (r) => ({ table: str(r.table) }),
   set_comment: (r) => ({ table: str(r.table), column: str(r.column), comment: str(r.comment, 300) ?? "" }),
   add_column: (r) => ({ table: str(r.table), column: cleanColumn(r.column), index: bool(r.index, true) }),
+  // A column Postgres calculates from others in the same row. The calculation is a template name, never an expression.
+  add_generated_column: (r) => ({ table: str(r.table), name: str(r.name, 80), template: oneOf(r.template, Object.keys(GENERATED), undefined), columns: strList(r.columns, 2) }),
   drop_column: (r) => ({ table: str(r.table), column: str(r.column) }),
   rename_column: (r) => ({ table: str(r.table), column: str(r.column), name: str(r.name, 80) }),
   alter_column_type: (r) => ({ table: str(r.table), column: str(r.column), type: cleanType(r.type) }),

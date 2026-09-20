@@ -1,4 +1,4 @@
-import { typeLabel, defaultLabel } from "./types.js";
+import { typeLabel, defaultLabel, GENERATED } from "./types.js";
 
 // Jev cannot write prose, so everything Creator says is composed here.
 
@@ -28,6 +28,8 @@ export function describeOp(op) {
     case "drop_table": return `Drop table ${t}`;
     case "set_comment": return `Describe ${op.column ? `${t}.${op.column}` : t}`;
     case "add_column": return `Add ${columnPhrase(op.column)} to ${t}`;
+    case "add_generated_column": return GENERATED[op.template]?.arity === 1 ? `Add ${op.name} to ${t}, always the ${GENERATED[op.template].symbol} ${op.columns[0]}`
+      : `Add ${op.name} to ${t}, always ${op.columns[0]} ${GENERATED[op.template]?.symbol ?? "?"} ${op.columns[1]}`;
     case "drop_column": return `Drop ${t}.${op.column}`;
     case "rename_column": return `Rename ${t}.${op.column} to ${op.name}`;
     case "alter_column_type": return `Change ${t}.${op.column} to ${typeLabel(op.type)}`;
@@ -42,7 +44,7 @@ export function describeOp(op) {
       : `Block deleting a row while ${t} rows still point at it (${op.name})`;
     case "add_unique": return op.columns.length > 1 ? `Allow each combination of ${op.columns.join(" + ")} only once in ${t}` : `Make ${t} (${op.columns.join(", ")}) unique`;
     case "add_check": return `Require ${t}.${op.column} to be ${String(op.template).replace(/_/g, " ")}`;
-    case "drop_constraint": return `Drop constraint ${op.name} from ${t}`;
+    case "drop_constraint": return `Remove the rule ${op.name} from ${t}`;
     case "add_index": return `${op.unique ? "Unique index" : "Index"} on ${t} (${op.columns.join(", ")})`;
     case "drop_index": return `Drop index ${op.name}`;
     case "create_enum": return `Create type ${op.name}: ${list(op.values, 8)}`;

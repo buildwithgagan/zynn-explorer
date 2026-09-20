@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { query, connectionInfo } from "../db.js";
-import { parseCatalogType, parseCatalogDefault, typeLabel, sameType } from "./types.js";
+import { parseCatalogType, parseCatalogDefault, parseCatalogGenerated, typeLabel, sameType } from "./types.js";
 
 // The design is Creator's picture of a database: plain JSON, so it can be cloned, diffed and sent to the browser.
 // `loadDesign()` reads it from the catalog; ops are then replayed on a clone to get the draft.
@@ -97,8 +97,17 @@ export async function loadDesign() {
       name: c.name, type: parseCatalogType(c.type, c.enum_id), nullable: !c.not_null,
       default: c.generated ? null : parseCatalogDefault(c.default),
       identity: c.identity === "a" ? "always" : c.identity === "d" ? "by_default" : null,
-      generated: Boolean(c.generated), comment: c.comment ?? null,
+      generated: Boolean(c.generated), comment: c.comment ?? null, ...(c.generated ? { generatedExpr: c.default } : {}),
     });
+  }
+  for (const table of byOid.values()) {
+    const names = table.columns.map((c) => c.name);
+    for (const c of table.columns) {
+      if (!c.generated) continue;
+      const as = parseCatalogGenerated(c.generatedExpr, names);
+      if (as) c.generatedAs = as;
+      delete c.generatedExpr;
+    }
   }
   for (const k of constraints) {
     const table = byOid.get(k.rel);

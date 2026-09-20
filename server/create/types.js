@@ -100,13 +100,37 @@ export const CHECKS = {
   not_blank: (c) => `length(trim(${c})) > 0`,
 };
 
-export const DEFAULT_KINDS = ["now", "uuid", "current_date", "bool", "number", "string", "empty_json", "enum_label"];
+export const DEFAULT_KINDS = ["now", "now_plus", "uuid", "current_date", "bool", "number", "string", "empty_json", "enum_label"];
+export const INTERVAL_UNITS = ["minutes", "hours", "days", "weeks", "months", "years"];
+
+// Calculations a generated column may use. `a` and `b` are already-quoted column identifiers; nothing else is interpolated.
+const NUMERIC = ["smallint", "integer", "bigint", "numeric", "real", "double precision"];
+const WHOLE = ["smallint", "integer", "bigint"];
+const MOMENT = ["timestamptz", "timestamp"];
+const TEXT = ["text", "varchar"];
+const numericResult = (a, b) => (WHOLE.includes(a) && WHOLE.includes(b) ? { base: "bigint" } : { base: "numeric" });
+export const GENERATED = {
+  multiply: { arity: 2, symbol: "×", sql: (a, b) => `${a} * ${b}`, result: (a, b) => NUMERIC.includes(a) && NUMERIC.includes(b) && numericResult(a, b) },
+  add: { arity: 2, symbol: "+", sql: (a, b) => `${a} + ${b}`, result: (a, b) => NUMERIC.includes(a) && NUMERIC.includes(b) && numericResult(a, b) },
+  subtract: {
+    arity: 2, symbol: "−", sql: (a, b) => `${a} - ${b}`,
+    result: (a, b) => (NUMERIC.includes(a) && NUMERIC.includes(b) ? numericResult(a, b) : MOMENT.includes(a) && a === b ? { base: "interval" } : a === "date" && b === "date" ? { base: "integer" } : null),
+  },
+  concat: { arity: 2, symbol: "joined with", sql: (a, b) => `${a} || ' ' || ${b}`, result: (a, b) => TEXT.includes(a) && TEXT.includes(b) && { base: "text" } },
+  lower: { arity: 1, symbol: "lowercase of", sql: (a) => `lower(${a})`, result: (a) => TEXT.includes(a) && { base: "text" } },
+};
 
 /** Validate a column default from an op. */
 export function cleanDefault(raw) {
   if (raw == null) return null;
   const kind = String(raw.kind ?? "");
   if (!DEFAULT_KINDS.includes(kind)) throw fail("That default is not one Creator can set");
+  if (kind === "now_plus") {
+    const amount = Number(raw.amount);
+    if (!Number.isInteger(amount) || amount < 1 || amount > 100_000) throw fail("The amount of time must be a whole number between 1 and 100000");
+    if (!INTERVAL_UNITS.includes(raw.unit)) throw fail("The unit must be minutes, hours, days, weeks, months or years");
+    return { kind, amount, unit: raw.unit };
+  }
   if (kind === "bool") return { kind, value: Boolean(raw.value) };
   if (kind === "number") {
     const value = Number(raw.value);
@@ -126,6 +150,11 @@ export function parseCatalogDefault(expr) {
   if (expr == null) return null;
   const e = expr.trim();
   if (/^(now\(\)|CURRENT_TIMESTAMP|transaction_timestamp\(\))$/i.test(e)) return { kind: "now" };
+  const plus = /^\(?now\(\) \+ '(\d+) (min|minute|hour|day|week|mon|month|year)s?'::interval\)?$/i.exec(e);
+  if (plus) {
+    const unit = { min: "minutes", minute: "minutes", hour: "hours", day: "days", week: "weeks", mon: "months", month: "months", year: "years" }[plus[2].toLowerCase()];
+    return { kind: "now_plus", amount: Number(plus[1]), unit };
+  }
   if (/^gen_random_uuid\(\)$/i.test(e)) return { kind: "uuid" };
   if (/^CURRENT_DATE$/i.test(e)) return { kind: "current_date" };
   if (/^(true|false)$/i.test(e)) return { kind: "bool", value: /^true$/i.test(e) };
@@ -141,5 +170,23 @@ export function parseCatalogDefault(expr) {
 export function defaultLabel(d) {
   if (!d) return null;
   if (d.raw) return d.raw;
+  if (d.kind === "now_plus") return `${d.amount} ${d.amount === 1 ? d.unit.slice(0, -1) : d.unit} from now`;
   return { now: "now()", uuid: "gen_random_uuid()", current_date: "current_date", empty_json: "{}" }[d.kind] ?? String(d.value);
+}
+
+/**
+ * A generated column read from the catalog, matched back to one of the templates above so its inputs are known
+ * (they cannot be dropped or retyped from under it). Anything else stays opaque: `null`.
+ */
+export function parseCatalogGenerated(expr, columnNames) {
+  const e = String(expr ?? "").trim().replace(/::text/g, "");
+  const id = '"?([A-Za-z_][\\w$]*)"?';
+  const known = (...names) => (names.every((n) => columnNames.includes(n)) ? names : null);
+  let m;
+  if ((m = new RegExp(`^\\(?${id} \\* ${id}\\)?$`).exec(e)) && known(m[1], m[2])) return { template: "multiply", columns: [m[1], m[2]] };
+  if ((m = new RegExp(`^\\(?${id} \\+ ${id}\\)?$`).exec(e)) && known(m[1], m[2])) return { template: "add", columns: [m[1], m[2]] };
+  if ((m = new RegExp(`^\\(?${id} - ${id}\\)?$`).exec(e)) && known(m[1], m[2])) return { template: "subtract", columns: [m[1], m[2]] };
+  if ((m = new RegExp(`^\\(?\\(?${id} \\|\\| ' '\\)? \\|\\| ${id}\\)?$`).exec(e)) && known(m[1], m[2])) return { template: "concat", columns: [m[1], m[2]] };
+  if ((m = new RegExp(`^lower\\(\\(?${id}\\)?\\)$`).exec(e)) && known(m[1])) return { template: "lower", columns: [m[1]] };
+  return null;
 }

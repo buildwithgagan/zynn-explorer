@@ -41,10 +41,20 @@ const CASES = [
   // Combined uniqueness, defaults, and what happens on delete.
   ["a customer can review a product only once", /^add_unique:reviews\((product_id,customer_id|customer_id,product_id)\)$/],
   ["sku and name together must be unique on products", /^add_unique:products\(name,sku\)$/],
+  ["a product sku must be unique within a category", /^add_unique:products\(category_id,sku\)$/],
   ["is active on products should default to false", /^set_default:products\.is_active=false$/],
   ["the status of orders should default to paid", /^set_default:orders\.status=paid$/],
   ["do not allow deleting a category that still has products", /^set_fk_action:products>restrict$/],
   ["when a product is deleted, keep its order items but clear the product", /^drop_not_null:order_items\.product_id set_fk_action:order_items>set_null$/],
+  // Calculated columns and relative defaults.
+  ["add a line total to order items that is quantity times unit price", /^add_generated_column:order_items\.line_total=multiply\(quantity,unit_price\)$/],
+  ["add a lowercase version of email called email lower to customers", /^add_generated_column:customers\.email_lower=lower\(email\)$/],
+  ["add a margin to order items that is unit price minus quantity", /^add_generated_column:order_items\.margin=subtract\(unit_price,quantity\)$/],
+  ["add a gap to order items: subtract quantity from unit price", /^add_generated_column:order_items\.gap=subtract\(unit_price,quantity\)$/],
+  ["placed at on orders should default to 2 days from now", /^set_default:orders\.placed_at=now_plus$/],
+  // Changing and removing a combination rule. The third item stages a rule first; the whole draft is compared.
+  ["reviews should be unique per product, customer and rating instead", /^add_unique:reviews\(product_id,customer_id,rating\)$/, [{ id: "rule", kind: "add_unique", table: "public.reviews", columns: ["product_id", "customer_id"] }]],
+  ["a customer no longer needs to be limited to one review per product, remove that rule", /^$/, [{ id: "rule", kind: "add_unique", table: "public.reviews", columns: ["product_id", "customer_id"] }]],
   ["review my schema", null],
   ["how many orders were placed last month", null],
   ["asdf qwerty lorem", null],
@@ -62,6 +72,7 @@ const sig = (o) => {
     case "rename_table": return `rename_table:${t(o.table)}>${o.name}`;
     case "add_index": return `add_index:${t(o.table)}(${o.columns})`;
     case "seed": return `seed:${o.rows}`;
+    case "add_generated_column": return `add_generated_column:${t(o.table)}.${o.name}=${o.template}(${o.columns})`;
     case "add_unique": return `add_unique:${t(o.table)}(${o.columns})`;
     case "set_default": return `set_default:${t(o.table)}.${o.column}=${o.default.value ?? o.default.kind}`;
     case "set_fk_action": return `set_fk_action:${t(o.table)}>${o.onDelete}`;
@@ -75,14 +86,14 @@ const status = await (await fetch(base + "/status")).json();
 if (!status.connected || !status.jev) throw new Error("The app must be connected to a scratch database, with TYPESAFE_API_KEY set");
 console.log(`database ${status.connection.database} · ${RUNS} runs each\n`);
 let bad = 0, tokens = 0, ms = 0, calls = 0;
-for (const [request, expect] of CASES) {
+for (const [request, expect, preset] of CASES) {
   const seen = new Map();
   let weakest = 1;
   for (let i = 0; i < RUNS; i++) {
-    const r = await post("/create/interpret", { request, ops: [] });
+    const r = await post("/create/interpret", { request, ops: preset ?? [] });
     if (r.error) { seen.set(`ERROR ${r.error}`, 1); continue; }
     const added = new Set(r.added);
-    const s = r.draft.ops.filter((o) => added.has(o.id)).map(sig).join(" ") || "(nothing staged)";
+    const s = preset ? r.draft.ops.map(sig).join(" ") : r.draft.ops.filter((o) => added.has(o.id)).map(sig).join(" ") || "(nothing staged)";
     seen.set(s, (seen.get(s) ?? 0) + 1);
     for (const j of r.judgments) if (j.applied && !j.rule) weakest = Math.min(weakest, j.p);
     tokens += r.usage?.input_tokens ?? 0; ms += r.ms; calls++;

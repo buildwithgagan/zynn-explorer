@@ -260,6 +260,22 @@ keep their audit events" changes what a link does on delete (delete too / keep a
 the links between the tables mentioned, Jev picks the link and the outcome, and a link that is to be cleared is
 made optional first.
 
+**Calculated columns.** "Add a line total to order items that is quantity times unit price" adds a
+`GENERATED ALWAYS AS (…) STORED` column (a Postgres default cannot read other columns, so this is what "computed from
+other columns" means). The calculation is one of five templates (multiply, add, subtract or the time between two
+moments, join two texts, lowercase); Jev picks the template and the new name, code checks the input types fit and
+derives the result type. Input columns named outright are taken in spoken order, "a minus b" and "subtract b from a"
+fix the order by rule, and only "the time between a and b" is left to Jev. A column that feeds a calculation cannot be
+dropped or retyped from under it, including calculated columns Create finds already in the database. Defaults can also
+be relative: "expires at should default to 30 days from now".
+
+**Changing a combination rule.** On a table that already has one, "memberships should be unique per organization,
+user and role instead" replaces it (drop and add in the same transaction), and "… no longer needs to be unique, remove
+that rule" drops it; Jev is asked which rule and, column by column, what the combination is afterwards. A rule still
+in the draft is edited in place. Removing a rule other tables reference is refused. "Unique" with a scope word (within,
+per, together, only once) is a combination rather than one column; when Jev splits between exactly those two readings,
+the wording settles it.
+
 Changes to a table that is still only in the draft are folded into its CREATE TABLE (required, optional,
 unique, not unique, type, rename, remove), and removing a draft table also removes the enum types staged for it.
 
@@ -269,11 +285,12 @@ Jev selects; it cannot invent. A name must appear in your message or in a bluepr
 things people buy" gets a question back, not a guess. One kind of change per message. Domains outside the
 ten blueprints start as plain named tables for you to fill in. Sample data is plausible, not realistic,
 and triggers or hand-written checks on existing tables can reject it (the trial run says which). Not
-covered: views, functions, triggers, partitioning, composite foreign keys, converting existing data to an enum, defaults other than a number, true/false, now, today, a UUID, an empty
+covered: views, functions, triggers, partitioning, composite foreign keys, converting existing data to an enum, calculations outside the five templates (constants, more than two
+columns, conditions), and defaults other than a number, true/false, now, today, a time from now, a UUID, an empty
 JSON object, an allowed value or quoted text. For those, **Open in SQL editor**. Identity columns need Postgres 10+, `gen_random_uuid()` 13+.
 
 To re-check Jev's readings after changing a question or threshold, connect the app to a scratch database
-with the online-store blueprint applied and run `node scripts/creator-regression.mjs` (38 requests × 3,
+with the online-store blueprint applied and run `node scripts/creator-regression.mjs` (46 requests × 3,
 reports flips). `node scripts/creator-ask.mjs "…"` prints how one request was read. `node scripts/creator-blueprints-live.mjs` dry-runs every blueprint plus sample data.
 
 ## Layout
