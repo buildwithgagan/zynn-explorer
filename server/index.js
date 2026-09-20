@@ -24,12 +24,22 @@ app.use("/api", (req, res, next) => {
   next();
 });
 
+/**
+ * An error's message, never blank. Connecting to "localhost" tries ::1 and 127.0.0.1; when both
+ * fail Node raises an AggregateError whose own message is empty and whose reasons are in `.errors`.
+ */
+function errorText(err) {
+  if (err?.message) return err.message;
+  const inner = [...new Set((err?.errors ?? []).map((e) => e?.message).filter(Boolean))];
+  return inner.join("; ") || err?.code || "The request failed, and the server gave no reason.";
+}
+
 const route = (handler) => async (req, res) => {
   try {
     res.json(await handler(req));
   } catch (err) {
     const status = err.status ?? (err.code ? 400 : 500); // pg errors carry a SQLSTATE code
-    res.status(status).json({ error: err.message, code: err.code, position: err.position, hint: err.hint, detail: err.detail });
+    res.status(status).json({ error: errorText(err), code: err.code, position: err.position, hint: err.hint, detail: err.detail });
   }
 };
 

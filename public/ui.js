@@ -154,7 +154,7 @@ export function download(name, text, type = "text/csv") {
 }
 
 export const loading = (label = "Loading") => h("div.loading", label);
-export const errorBox = (err) => h("div.error", err.message + (err.hint ? `\nHint: ${err.hint}` : "") + (err.detail ? `\n${err.detail}` : ""));
+export const errorBox = (err) => h("div.error", (err.message || err.code || "Something went wrong, and no reason was given.") + (err.hint ? `\nHint: ${err.hint}` : "") + (err.detail ? `\n${err.detail}` : ""));
 
 /** Mount an async view: shows a spinner, then the view or an error. */
 export async function mount(container, build) {

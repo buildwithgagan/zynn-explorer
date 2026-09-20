@@ -67,15 +67,16 @@ function rememberConnection(c) {
 }
 
 function explainConnectError(err) {
-  const m = err.message ?? "";
-  if (/ECONNREFUSED/.test(m)) return "Nothing is accepting connections at that host and port. Check that Postgres is running and the port is right (Docker containers often map to a port other than 5432).";
+  // The error code is checked as well as the text: some failures arrive with a code and no message.
+  const m = `${err.message ?? ""} ${err.code ?? ""}`.trim();
+  if (/ECONNREFUSED/.test(m)) return "Nothing is accepting connections at that host and port. Check that Postgres is running — for a Docker database, that Docker itself is running — and that the port is right (containers often map to a port other than 5432).";
   if (/ENOTFOUND|EAI_AGAIN/.test(m)) return "That host name could not be resolved.";
   if (/password authentication failed/.test(m)) return "The server rejected that user and password.";
   if (/no password supplied|SASL/.test(m)) return "This server requires a password.";
   if (/does not exist/.test(m)) return m.charAt(0).toUpperCase() + m.slice(1) + ".";
   if (/timeout|ETIMEDOUT/i.test(m)) return "The connection timed out. The host may be unreachable or blocked by a firewall.";
   if (/SSL|TLS/.test(m)) return `${m}. Try toggling "Require SSL".`;
-  return m;
+  return m || "The connection failed, and no reason was given.";
 }
 
 async function connectScreen(message) {
