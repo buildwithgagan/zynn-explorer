@@ -239,18 +239,35 @@ check/default/policy templates; there is no free SQL expression anywhere in an o
 plain snake_case, not reserved, at most 63 bytes. Roles are always created `NOLOGIN`: a password never
 passes through the chat or the model. Only the request text and table, column and role names go to TypeSafe.
 
+**What code decides, not Jev.** Anything checkable is a rule: a phrase that matches an existing table is a
+table; a bracketed list after a name is that field's allowed values, multi-word ones included
+("purpose (email verification, password reset)"); a trailing "at" belongs to the name ("expires at"); a name
+starting with is/has is a flag; `password hash`, `token hash`, `ip address`, a bare `name` and `*_id` have
+fixed archetypes; "customer id" next to a customers table is a reference; "invoice numbers must be unique"
+restates `number` rather than adding a column; a many-to-many table is named in the order it was said
+(`user_roles`). When "add … to a table" finds no field out of context, Create asks once more with the
+context ("is *limit value* the column to add to plan_features?").
+
+**Application roles are tables; Postgres roles are access.** "Create a roles table" and "roles can have many
+permissions" build tables. "Create a read-only role called analyst" and "let the api role edit users"
+create Postgres roles and grants ("the api role" names the role `api`).
+
+Changes to a table that is still only in the draft are folded into its CREATE TABLE (required, optional,
+unique, not unique, type, rename, remove), and removing a draft table also removes the enum types staged for it.
+
 ### Limits
 
 Jev selects; it cannot invent. A name must appear in your message or in a blueprint, so "a table for the
 things people buy" gets a question back, not a guess. One kind of change per message. Domains outside the
 ten blueprints start as plain named tables for you to fill in. Sample data is plausible, not realistic,
 and triggers or hand-written checks on existing tables can reject it (the trial run says which). Not
-covered: views, functions, triggers, partitioning, composite foreign keys, converting existing data to an
-enum. For those, **Open in SQL editor**. Identity columns need Postgres 10+, `gen_random_uuid()` 13+.
+covered: views, functions, triggers, partitioning, composite foreign keys, unique rules across several
+columns ("one membership per user per organization"), column defaults, changing ON DELETE after the fact,
+converting existing data to an enum. For those, **Open in SQL editor**. Identity columns need Postgres 10+, `gen_random_uuid()` 13+.
 
 To re-check Jev's readings after changing a question or threshold, connect the app to a scratch database
-with the online-store blueprint applied and run `node scripts/creator-regression.mjs` (25 requests × 3,
-reports flips). `node scripts/creator-blueprints-live.mjs` dry-runs every blueprint plus sample data.
+with the online-store blueprint applied and run `node scripts/creator-regression.mjs` (32 requests × 3,
+reports flips). `node scripts/creator-ask.mjs "…"` prints how one request was read. `node scripts/creator-blueprints-live.mjs` dry-runs every blueprint plus sample data.
 
 ## Layout
 

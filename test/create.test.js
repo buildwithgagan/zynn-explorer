@@ -9,7 +9,7 @@ import { generateRows } from "../server/create/seed.js";
 import { mulberry32, inferArchetype } from "../server/create/archetypes.js";
 import { parseCatalogType, parseCatalogDefault, isSafeWidening } from "../server/create/types.js";
 import { describeOp, summarizeOps } from "../server/create/wording.js";
-import { identCandidates, tableIdent, toSnake, singularize } from "../server/nl/candidates.js";
+import { identCandidates, tableIdent, toSnake, singularize, valueLists } from "../server/nl/candidates.js";
 
 const T = (base, ...args) => (args.length ? { base, args } : { base });
 const table = (name, columns, extra = {}) => ({ kind: "create_table", name, columns, ...extra });
@@ -208,6 +208,10 @@ test("sample data respects foreign keys, uniqueness, checks and enums, and is re
   assert.throws(() => generateRows(design, "public.orders", 5, mulberry32(1), {}), /customers has no rows/);
   assert.equal(inferArchetype({ name: "email", type: T("text") }), "email");
   assert.equal(inferArchetype({ name: "email", type: T("integer") }), "count");
+  assert.equal(inferArchetype({ name: "password_hash", type: T("text") }), "password_hash");
+  assert.equal(inferArchetype({ name: "token_hash", type: T("text") }), "secret_hash");
+  assert.equal(inferArchetype({ name: "ip_address", type: T("inet") }), "ip_address");
+  assert.ok(identCandidates("create a roles table and a permissions table for users").map((c) => c.ident).includes("roles"));
 });
 
 test("the advisor finds what a DBA would, and each fix compiles", () => {
@@ -256,9 +260,15 @@ test("catalog types and defaults round-trip into the design's vocabulary", () =>
 
 test("names come from the request: phrases become identifiers by rule", () => {
   const idents = (r) => identCandidates(r).map((c) => c.ident);
-  assert.deepEqual(idents("create a table called invoices with number, amount, due date and status"), ["invoices", "number", "amount", "due_date", "due", "date", "status"]);
+  assert.deepEqual(idents("create a table called invoices with number, amount, due date and status"), ["invoices", "number", "amount", "due_date", "status", "due", "date"]);
   assert.ok(idents("add first name and date of birth to patients").includes("date_of_birth"));
+  // "at" closes a name, "full" is not filler, and whole phrases come before their fragments.
+  assert.deepEqual(idents("users with full name, email verified at and last login at").slice(0, 4), ["users", "full_name", "email_verified_at", "last_login_at"]);
   assert.deepEqual(idents('add a column "Order Ref" to orders').slice(0, 1), ["order_ref"]);
+  // A bracketed list after a name is that field's allowed values, multi-word values included.
+  assert.deepEqual(valueLists("tokens with purpose (email verification, password reset) and status (a, b or c)").map((l) => [l.fields.at(-1), l.values]),
+    [["purpose", ["email_verification", "password_reset"]], ["status", ["a", "b", "c"]]]);
+  assert.deepEqual(valueLists("add notes (optional) to users"), []);
   assert.equal(tableIdent("order item"), "order_items");
   assert.equal(tableIdent("Category"), "categories");
   assert.equal(tableIdent("staff"), "staff");

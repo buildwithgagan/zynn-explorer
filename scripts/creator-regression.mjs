@@ -24,12 +24,20 @@ const CASES = [
   ["remove the line2 column from addresses", /^drop_column:addresses\.line2$/],
   ["delete the payments table", /^drop_table:payments$/],
   ["each review belongs to an order", /^add_column:reviews\.order_id$/],
-  ["products can have many categories and categories many products", /^create_table:category_products$/],
+  ["products can have many categories and categories many products", /^create_table:product_categories$/],
   ["index orders by placed at", /^add_index:orders\(placed_at\)$/],
   ["fill every table with 50 sample rows", /^seed:50$/],
   ["add 10 fake rows to customers", /^seed:10$/],
   ["create a read-only role called analyst", /^create_role:analyst grant:analyst\[SELECT\]$/],
   ["let the support role read and edit orders", /^create_role:support grant:support\[SELECT,UPDATE\]$/],
+  // An application's own roles and permissions are tables, not Postgres roles.
+  ["create a roles table with name and description", /^create_table:roles$/],
+  ["create a table called permissions with name and description", /^create_table:permissions$/],
+  ["create a table called users with email and password hash", /^create_table:users$/],
+  ["create a table called verification tokens with purpose (email verification, password reset), token hash and expires at", /^create_enum:verification_token_purpose create_table:verification_tokens$/],
+  ["create a table called roles with name, description and is system", /^create_table:roles$/],
+  ["the email on customers does not need to be unique", /^drop_constraint:customers$/],
+  ["create a table called tickets with number and subject. ticket numbers must be unique", /^create_table:tickets\[number,subject\]$/],
   ["review my schema", null],
   ["how many orders were placed last month", null],
   ["asdf qwerty lorem", null],
@@ -41,7 +49,7 @@ const post = async (path, body) => (await fetch(base + path, { method: "POST", h
 const sig = (o) => {
   const t = (id) => String(id ?? "").split(".").pop();
   switch (o.kind) {
-    case "create_table": return `create_table:${o.name}${o.columns.some((c) => !c.ref) && o.name === "invoices" ? `[${o.columns.map((c) => c.name)}]` : ""}`;
+    case "create_table": return `create_table:${o.name}${o.columns.some((c) => !c.ref) && ["invoices", "tickets"].includes(o.name) ? `[${o.columns.map((c) => c.name)}]` : ""}`;
     case "add_column": return `add_column:${t(o.table)}.${o.column.name}`;
     case "rename_column": return `rename_column:${t(o.table)}.${o.column}>${o.name}`;
     case "rename_table": return `rename_table:${t(o.table)}>${o.name}`;

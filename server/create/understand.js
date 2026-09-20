@@ -1,5 +1,5 @@
 import { ask, choice, noul } from "../jev.js";
-import { identCandidates, numberCandidates, tableIdent, singularize } from "../nl/candidates.js";
+import { identCandidates, numberCandidates, tableIdent, singularize, valueLists } from "../nl/candidates.js";
 import { ARCHETYPES, archetypeByName, columnFromArchetype } from "./archetypes.js";
 import { BLUEPRINTS, blueprintById, entitiesOf, instantiate } from "./blueprints/index.js";
 import { newId } from "./ops.js";
@@ -27,15 +27,15 @@ const top = (answer) => ranked(answer)[0] ?? { value: null, p: 0 };
 const OPS = {
   design_domain: "Design a whole database or system for some business or purpose, with several tables at once. Examples: 'build me a database for a vet clinic', 'I need an online store', 'schema for a blog'.",
   new_database: "Create a new, empty database on the server. Examples: 'create a database called shop', 'new db named testing'.",
-  create_table: "Create one or more specific new tables, usually naming their fields. Examples: 'create a table called invoices with number and amount', 'add a suppliers table'.",
+  create_table: "Create one or more specific new tables, usually naming their fields. Examples: 'create a table called invoices with number and amount', 'add a suppliers table', 'create a roles table with name and description', 'a permissions table'.",
   add_columns: "Add one or more new columns or fields to a table that already exists. Examples: 'add a phone number to customers', 'patients also need date of birth and allergies'.",
-  change_column: "Change how an existing column behaves: the type of data it holds, whether it is required or optional, or whether its values must be unique. Examples: 'make email required', 'phone should be optional', 'change price to a decimal', 'change quantity to a big whole number', 'turn notes into json', 'emails must be unique'.",
+  change_column: "Change how an existing column behaves: the type of data it holds, whether it is required or optional, or whether its values must be unique. Examples: 'make email required', 'phone should be optional', 'change price to a decimal', 'change quantity to a big whole number', 'turn notes into json', 'emails must be unique', 'billing email does not need to be unique'.",
   rename_thing: "Give an existing table or column a different name. Examples: 'rename clients to customers', 'call the fullname column name instead'.",
   remove_thing: "Delete an existing table or column. Examples: 'drop the legacy table', 'remove the fax column from contacts', 'get rid of notes'.",
   relate_tables: "Connect two tables that exist: one belongs to the other, or they are many-to-many. Examples: 'orders belong to customers', 'each post has one author', 'posts can have many tags'.",
   add_index: "Add an index to make lookups faster. Examples: 'index orders by created_at', 'add an index on email'.",
   seed_data: "Fill tables with sample, fake or test rows. Examples: 'add 50 fake rows', 'fill it with sample data', 'seed the customers table'.",
-  access: "Roles, permissions or row-level security: create a role, grant or revoke access, restrict which rows someone sees. Examples: 'create a read-only role', 'let analysts read orders', 'users should only see their own rows'.",
+  access: "Database-level access: Postgres roles and privileges for the people or services that connect to the database, or row-level security. Examples: 'create a read-only role called analyst', 'let the reporting role read orders', 'revoke delete from the app role', 'users should only see their own rows'. Not this: tables that store an application's own users, roles or permissions.",
   advise: "Review or critique the existing design and suggest improvements. Examples: 'review my schema', 'what should I improve', 'any problems with this design'.",
   data_question: "A question about the data stored in the tables, not a change to their structure. Examples: 'how many orders last month', 'show me the top customers'.",
   other: "None of the above: not a request about this database.",
@@ -143,6 +143,25 @@ function wordingQuestions(spans) {
   return q;
 }
 
+/**
+ * "invoice numbers must be unique" talks about the field `number` again; it is not a second field.
+ * A phrase is a restatement when, with the table's own name and a plural ending taken off, it is another field.
+ */
+function dropRestatements(fields, tableNames) {
+  const names = new Set(fields.map((f) => f.ident));
+  const prefixes = tableNames.flatMap((t) => [singularize(t), t]);
+  return fields.filter((f) => {
+    const forms = [f.ident, ...prefixes.filter((p) => f.ident.startsWith(p + "_")).map((p) => f.ident.slice(p.length + 1))];
+    return !forms.flatMap((x) => [x, singularize(x)]).some((x) => x !== f.ident && names.has(x));
+  });
+}
+
+/** Whether every occurrence of `text` in the request sits inside a bracketed list. */
+function inBrackets(request, text) {
+  const outside = request.replace(/\([^()]*\)/g, " ");
+  return !new RegExp(`\\b${text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "i").test(outside);
+}
+
 /** Keep the longest accepted phrase of each run: once "first name" is a field, "first" and "name" are not. */
 function dropOverlaps(accepted) {
   const kept = [];
@@ -174,14 +193,30 @@ function valueQuestions(q, values, fields) {
 }
 
 /** Column specs (and the enums they need) from the answers about `fields`. */
-function buildFields(reading, answers, fields, values, tableName, schema) {
+function buildFields(reading, answers, fields, values, tableName, schema, lists, refFor = () => null, existingEnums = {}) {
   const columns = [], enums = [], weak = [];
   const valuesOf = fields.map(() => []);
+  const listedValues = new Set();
+  for (const list of lists ?? []) {
+    const at = fields.findIndex((f) => list.fields.includes(f.ident));
+    if (at < 0) continue;
+    valuesOf[at] = [...list.values];
+    list.values.forEach((v) => listedValues.add(v));
+  }
   values.forEach((v, i) => {
+    if (listedValues.has(v.ident)) return;
     const pick = top(answers[`val:${i}`]);
     if (pick.value?.startsWith("f") && pick.p >= STATED) valuesOf[Number(pick.value.slice(1))].push(v.ident);
   });
   fields.forEach((f, i) => {
+    // "customer id" on a table next to a customers table is a reference, not a piece of text.
+    const parent = /_id$/.test(f.ident) && refFor(f.ident.slice(0, -3));
+    if (parent) {
+      const required = reading.noul(`req:${i}`, `${f.ident} required`, answers[`req:${i}`]).ok;
+      reading.rule(`ref:${i}`, `${f.ident} points at`, parent.label);
+      columns.push({ name: f.ident, ref: { table: parent.id, onDelete: "restrict" }, nullable: !required });
+      return;
+    }
     const byRule = archetypeByName(f.ident);
     let archetype = byRule, sure = true;
     if (byRule) reading.rule(`arch:${i}`, `${f.ident} is`, byRule.replace(/_/g, " "));
@@ -196,7 +231,8 @@ function buildFields(reading, answers, fields, values, tableName, schema) {
     const column = columnFromArchetype(safeName(f.ident), archetype, overrides);
     if (valuesOf[i].length >= 2) {
       const typeName = `${singularize(tableName)}_${column.name}`;
-      enums.push({ id: newId(), kind: "create_enum", schema, name: typeName, values: valuesOf[i] });
+      const same = existingEnums?.[`${schema}.${typeName}`];
+      if (!same || same.values.join() !== valuesOf[i].join()) enums.push({ id: newId(), kind: "create_enum", schema, name: typeName, values: valuesOf[i] });
       Object.assign(column, { type: { enum: `${schema}.${typeName}` }, nullable: false, default: { kind: "enum_label", value: valuesOf[i][0] }, check: undefined, unique: undefined });
       reading.rule(`enum:${i}`, `${f.ident} values`, valuesOf[i].join(", "));
     }
@@ -268,6 +304,12 @@ function foldIntoStaged(ops, baseline, op) {
     case "drop_table": {
       if (ops.some((o) => o !== create && (touched(o) || o.column?.ref?.table === op.table || o.columns?.some?.((c) => c.ref?.table === op.table)))) return null;
       ops.splice(ops.indexOf(create), 1);
+      // Enum types staged for this table go with it, unless something else in the draft uses them.
+      const used = new Set(ops.flatMap((o) => [...(o.columns ?? []), o.column].filter(Boolean).map((c) => c.type?.enum)).filter(Boolean));
+      for (const id of create.columns.map((c) => c.type?.enum).filter(Boolean)) {
+        const at = ops.findIndex((o) => o.kind === "create_enum" && `${o.schema}.${o.name}` === id);
+        if (at >= 0 && !used.has(id)) ops.splice(at, 1);
+      }
       return `Removed ${create.name} from the draft. It was never created, so nothing is lost.`;
     }
     default: return null;
@@ -278,7 +320,8 @@ const fkColumn = (design, id) => `${singularize(design.tables[id]?.name ?? id.sp
 
 function relationOps(design, a, b, kind, onDelete) {
   if (kind === "many_to_many") {
-    const [x, y] = [a, b].sort();
+    // Named the way it was said: "users can have many roles" → user_roles.
+    const [x, y] = [a, b];
     const tx = design.tables[x], ty = design.tables[y];
     return [{
       id: newId(), kind: "create_table", schema: tx.schema, name: `${singularize(tx.name)}_${ty.name}`,
@@ -335,16 +378,24 @@ export async function interpret(request, baseline, draft, current) {
   if (op.value === "data_question") return decline(DECLINES.data_question, { askInstead: request });
   if (op.value === "advise") return done({ reply: { text: "I reviewed the draft as it stands. The findings are in the Advisor tab, most with a one-click fix." }, focus: "advisor" });
 
-  const roles = spans.map((s, i) => ({ ...s, role: top(first[`span:${i}`]) })).filter((s) => s.role.p >= STATED);
+  const existingByIdent = (ident) => tables.find((t) => [ident, tableIdent(ident), singularize(ident)].includes(t.table.name));
+  // Values listed in brackets after a name are read by rule; Jev is not asked to guess what "password reset" is.
+  const lists = valueLists(request);
+  const listed = new Set(lists.flatMap((l) => l.values));
+  const roles = spans
+    .filter((s) => listed.has(s.ident) || !listed.size || !inBrackets(request, s.text)) // a fragment of a listed value is nothing
+    // Whether a phrase names a table that exists is a fact, so it is not asked.
+    .map((s) => ({ ...s, role: listed.has(s.ident) ? { value: "example_value", p: 1 } : existingByIdent(s.ident) ? { value: "table_name", p: 1 } : top(first[`span:${s.order}`]) }))
+    .filter((s) => s.role.p >= STATED);
   const of = (role) => dropOverlaps(roles.filter((s) => s.role.value === role));
-  const tableSpans = of("table_name"), fieldSpans = of("field_name").slice(0, MAX_FIELDS), valueSpans = of("example_value");
+  const tableSpans = of("table_name"), valueSpans = of("example_value");
+  const fieldSpans = dropRestatements(of("field_name"), tableSpans.map((s) => tableIdent(s.ident))).slice(0, MAX_FIELDS);
   for (const s of [...tableSpans, ...fieldSpans, ...valueSpans, ...of("role_name"), ...of("database_name")]) {
     reading.judgments.push({ key: `span:${s.order}`, title: `"${s.text}" is`, value: s.role.value.replace(/_/g, " "), p: s.role.p, applied: true, alternatives: [] });
   }
   const target = reading.choice("target", "Table", first.target, { labels: { [NEW]: "a new table", [NONE]: "no single table" }, applied: !["design_domain", "new_database", "create_table"].includes(op.value) });
   const targetTable = target.ok && byLabel.get(target.value);
   const mentioned = tables.filter((t) => (first[`uses:${t.label}`]?.noul ?? 0) >= STATED);
-  const existingByIdent = (ident) => tables.find((t) => [ident, tableIdent(ident), singularize(ident)].includes(t.table.name));
 
   // -- a new database ------------------------------------------------------
   if (op.value === "new_database") {
@@ -442,7 +493,7 @@ export async function interpret(request, baseline, draft, current) {
       ["arch", "req", "uniq"].forEach(remap);
       const myValues = valueSpans.map((v, vi) => ({ v, pick: top(second[`val:${vi}`]) })).filter(({ pick }) => pick.value?.startsWith("f") && mine.some(({ i }) => i === Number(pick.value.slice(1))));
       myValues.forEach(({ pick }, n) => { sub[`val:${n}`] = { probabilities: { [`f${mine.findIndex(({ i }) => i === Number(pick.value.slice(1)))}`]: pick.p } }; });
-      const built = buildFields(reading, sub, mine.map(({ f }) => f), myValues.map(({ v }) => v), name, schema);
+      const built = buildFields(reading, sub, mine.map(({ f }) => f), myValues.map(({ v }) => v), name, schema, lists, (stem) => existingByIdent(stem), draft.enums);
       allEnums.push(...built.enums);
       weak.push(...built.weak.map((c) => `${name}.${c}`));
       made.push({ id: newId(), kind: "create_table", schema, name, columns: built.columns.length ? built.columns : [columnFromArchetype("name", "title")], conventions: { id: true, timestamps: true, fkIndex: true } });
@@ -546,13 +597,21 @@ export async function interpret(request, baseline, draft, current) {
   const columnOptions = Object.fromEntries(t.table.columns.slice(0, 120).map((c) => [c.name, `${typeLabel(c.type)}${c.nullable ? "" : ", required"}`]));
 
   if (op.value === "add_columns") {
-    const fields = fieldSpans.filter((f) => !t.table.columns.some((c) => c.name === f.ident));
+    let fields = fieldSpans.filter((f) => !t.table.columns.some((c) => c.name === f.ident));
+    if (!fields.length && !fieldSpans.length) {
+      // Out of context "limit value" could be anything. Knowing the request adds columns to this table, ask again, plainly.
+      const open = dropOverlaps(spans.filter((s) => !existingByIdent(s.ident) && !listed.has(s.ident) && !tableSpans.some((ts) => ts.run === s.run && s.start < ts.end && ts.start < s.end)));
+      if (open.length) {
+        const again = await reading.ask({ request }, Object.fromEntries(open.map((s) => [`col:${s.order}`, noul(`\`request\` asks to add one or more columns to the table "${t.label}". Is "${s.text}" the name of a column to add?`)])));
+        fields = open.filter((s) => reading.noul(`col:${s.order}`, `"${s.text}" is a new column`, again[`col:${s.order}`]).ok && !t.table.columns.some((c) => c.name === s.ident));
+      }
+    }
     if (!fields.length) return decline(fieldSpans.length ? `${t.label} already has ${fieldSpans.map((f) => f.ident).join(", ")}.` : DECLINES.no_names);
     const q = {};
     fieldQuestions(q, fields);
     valueQuestions(q, valueSpans, fields);
     const second = await reading.ask({ request }, q);
-    const built = buildFields(reading, second, fields, valueSpans, t.table.name, t.table.schema);
+    const built = buildFields(reading, second, fields, valueSpans, t.table.name, t.table.schema, lists, (stem) => { const p = existingByIdent(stem); return p && p.id !== t.id ? p : null; }, draft.enums);
     const staged = !Object.hasOwn(baseline.tables, t.id);
     // A required column cannot be added to a table that already holds rows unless it has a default.
     const relaxed = [];
@@ -571,6 +630,7 @@ export async function interpret(request, baseline, draft, current) {
       make_required: "The column must always have a value (required, mandatory, not null).",
       make_optional: "The column may be left empty (optional, nullable).",
       make_unique: "No two rows may share a value in this column.",
+      allow_duplicates: "The column does not need to be unique: several rows may share the same value.",
       change_type: "The column should hold a different type of data.",
       remove_default: "The column should no longer have a default value.",
     });
@@ -625,12 +685,24 @@ export async function interpret(request, baseline, draft, current) {
   }
   // change_column
   if (!col.ok || col.value === NONE) return decline(noColumn);
-  const change = reading.choice("change", "Change", second.change, { labels: { make_required: "required", make_optional: "optional", make_unique: "unique", change_type: "new type", remove_default: "no default" } });
+  const change = reading.choice("change", "Change", second.change, { labels: { make_required: "required", make_optional: "optional", make_unique: "unique", allow_duplicates: "not unique", change_type: "new type", remove_default: "no default" } });
   if (!change.ok) return decline("I found the column but not what to change about it. Say, for example: \"make it required\", \"make it optional\", \"must be unique\" or \"change it to a date\".");
   const base = { id: newId(), table: t.id, column: col.value };
   if (change.value === "make_required") return stage([{ ...base, kind: "set_not_null" }]);
   if (change.value === "make_optional") return stage([{ ...base, kind: "drop_not_null" }]);
   if (change.value === "remove_default") return stage([{ ...base, kind: "drop_default" }]);
+  if (change.value === "allow_duplicates") {
+    const staged = !Object.hasOwn(baseline.tables, t.id) && ops.find((o) => o.kind === "create_table" && `${o.schema}.${o.name}` === t.id);
+    const column = staged ? staged.columns.find((c) => c.name === col.value) : null;
+    if (column) {
+      if (!column.unique) return decline(`${t.label}.${col.value} is not unique in the draft.`);
+      column.unique = false;
+      return done({ reply: { text: `${t.label}.${col.value} no longer has to be unique in the draft.` }, added: [] });
+    }
+    const rule = t.table.uniques.find((u) => u.columns.length === 1 && u.columns[0] === col.value);
+    if (!rule) return decline(`${t.label}.${col.value} has no unique rule of its own to remove.`);
+    return stage([{ id: newId(), kind: "drop_constraint", table: t.id, name: rule.name }]);
+  }
   if (change.value === "make_unique") return stage([{ id: base.id, kind: "add_unique", table: t.id, columns: [col.value] }]);
   const newtype = reading.choice("newtype", "New type", second.newtype, { labels: { [NONE]: "not stated" } });
   if (!newtype.ok || newtype.value === NONE) return decline("I couldn't tell which type you want. Say, for example: \"change it to a whole number\", \"to a date\" or \"to money\".");

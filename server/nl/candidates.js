@@ -178,16 +178,16 @@ export function resolveWindow(windowKey, { year, month } = {}, now = new Date())
 // Creator: names for new things. Jev cannot invent an identifier, so every table, column, role or
 // database name it can choose is a phrase taken from the request and normalised here.
 // ---------------------------------------------------------------------------
-const CREATOR_STOPWORDS = new Set(`a an the in on at to for from by with without and or not no is are was were be been it its this that these those
+const CREATOR_STOPWORDS = new Set(`a an the in on to for from by with without and or not no is are was were be been it its this that these those
 i we my our us you your please want need would like can could should will let lets make makes create creates add adds adding new build set up
 give put include including also plus then so into onto each every all some any has have having where which that whose as per
 table tables column columns field fields attribute attributes property properties database db schema called named me them they
 store stores storing track tracks tracking keep keeps hold holds record records contain contains containing
 change rename drop remove delete alter modify update make required optional unique index indexed mandatory nullable
-role roles user grant revoke access permission permissions read write only allow allowed
+grant revoke read write only allow allowed
 rows row sample fake dummy test data fill seed populate generate insert
 should must need needs there their one many belongs belong between link linked relate related relation relationship reference references
-type kind instead rather just but too well system app application simple basic full complete proper`.split(/\s+/));
+type kind instead rather just but too well simple basic complete proper`.split(/\s+/));
 
 const IRREGULAR = { person: "people", child: "children", man: "men", woman: "women", mouse: "mice", foot: "feet", tooth: "teeth", goose: "geese" };
 const UNCOUNTABLE = new Set(["staff", "media", "data", "news", "series", "equipment", "information", "inventory", "stock", "feedback", "software", "hardware"]);
@@ -228,7 +228,7 @@ export function tableIdent(text) {
  * of words that are not filler. → [{ text, ident, run, start, end }], longest phrases of each run first.
  * `run`/`start`/`end` let the caller drop "first" and "name" once "first name" has been accepted.
  */
-export function identCandidates(request, max = 24) {
+export function identCandidates(request, max = 36) {
   const out = [];
   const add = (text, run, start, end) => {
     const ident = toSnake(text);
@@ -243,26 +243,49 @@ export function identCandidates(request, max = 24) {
   }
   const runs = [];
   let words = [];
-  const close = () => { while (words.at(-1) === "of") words.pop(); if (words.length) runs.push(words); words = []; };
+  // "of" joins words inside a name (date of birth); "at" ends one (verified at, expires at). Neither can start a name.
+  const close = () => { while (words.at(-1) === "of") words.pop(); if (words.length && !(words.length === 1 && /^(is|has)$/i.test(words[0]))) runs.push(words); words = []; };
   for (const token of rest.split(/(\s+|[|,;:!?()./]+)/)) {
     if (!token || /^\s+$/.test(token)) continue;
     const word = token.replace(/^[^\w]+|[^\w]+$/g, "").replace(/'s$/, "");
     const lower = word.toLowerCase();
     if (!word || /^[|,;:!?()./]+$/.test(token) || /^\d+$/.test(word) || lower in NUMBER_WORDS) close();
     else if (lower === "of") { if (words.length) words.push("of"); }
+    // "is active", "has paid": a flag's name starts with is/has, but only at the start of a name. Mid-sentence it is a verb.
+    else if ((lower === "is" || lower === "has") && !words.length) words.push(word);
+    else if (lower === "at") { if (words.length && words.at(-1) !== "of") { words.push("at"); close(); } }
     else if (CREATOR_STOPWORDS.has(lower)) close();
     else words.push(word);
   }
   close();
-  for (const list of runs) {
-    for (let size = Math.min(3, list.length); size >= 1; size--) {
+  // Whole phrases of every run first, then their parts: a long request must not spend the budget on the
+  // fragments of its first names and lose its last ones.
+  const grams = (list, id, sizes) => {
+    for (const size of sizes) {
       for (let i = 0; i + size <= list.length; i++) {
         const slice = list.slice(i, i + size);
-        if (slice[0] === "of" || slice.at(-1) === "of") continue;
-        add(slice.join(" "), run, i, i + size);
+        if (slice[0] === "of" || slice.at(-1) === "of" || slice[0] === "at" || (size === 1 && /^(is|has)$/i.test(slice[0]))) continue;
+        add(slice.join(" "), id, i, i + size);
       }
     }
-    run++;
+  };
+  runs.forEach((list, n) => grams(list, run + n, [Math.min(3, list.length)]));
+  runs.forEach((list, n) => grams(list, run + n, [2, 1].filter((size) => size < Math.min(3, list.length))));
+  return out;
+}
+
+/**
+ * "status (draft, sent, paid)": a parenthesised list straight after a name is the list of its allowed values.
+ * That is syntax, so code reads it. → [{ field: "status", values: ["draft", "sent", "paid"] }] as identifiers.
+ */
+export function valueLists(request) {
+  const out = [];
+  for (const m of request.matchAll(/([A-Za-z][\w ]{0,60}?)\s*\(([^()]{3,200})\)/g)) {
+    const values = m[2].split(/,|\bor\b|\band\b|\/|\|/i).map(toSnake).filter((v) => v.length >= 1 && v.length <= 40);
+    const words = m[1].trim().split(/\s+/).slice(-3);
+    if (values.length < 2 || new Set(values).size !== values.length) continue;
+    // The name is the tail of the text before the bracket: try "a b c", then "b c", then "c".
+    out.push({ fields: words.map((_, i) => toSnake(words.slice(i).join(" "))).filter(Boolean), values });
   }
   return out;
 }
