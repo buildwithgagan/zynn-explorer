@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Zynn Explorer</title>
+  <meta name="description" content="Explore and query Postgres in plain English. Part of Zynn.">
+  <link rel="icon" href="icon.svg" type="image/svg+xml">
+  <link rel="preload" href="fonts/mona-sans-latin-wght-normal.woff2" as="font" type="font/woff2" crossorigin>
+  <script>
+    // The appearance, decided before first paint. Same rule and storage key as the Zynn Console:
+    // dark unless the stored theme is "light", or "system" on a light-preferring device.
+    (function () {
+      try {
+        var t = localStorage.getItem("zynn.theme");
+        var light = t === "light" || (t === "system" && !(window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches));
+        document.documentElement.classList.toggle("light", light);
+        document.documentElement.setAttribute("data-appearance", light ? "light" : "dark");
+      } catch (e) { /* storage unavailable: stay dark */ }
+    })();
+  </script>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div id="app"></div>
+  <script type="module" src="app.js"></script>
+</body>
+</html>

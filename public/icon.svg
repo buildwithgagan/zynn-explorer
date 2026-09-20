@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32">
+  <title>Zynn</title>
+  <!-- The Zynn mark. Same geometry and colours as the Zynn Console's app/icon.svg; keep them in step. -->
+  <rect width="32" height="32" rx="7" fill="#000000"/>
+  <path d="M17 6H25L15 26H7Z M7 6H13L10 12H4Z M22 20H28L25 26H19Z" fill="#2b7fff"/>
+</svg>
