@@ -187,7 +187,8 @@ change rename drop remove delete alter modify update make required optional uniq
 grant revoke read write only allow allowed
 rows row sample fake dummy test data fill seed populate generate insert
 should must need needs there their one many belongs belong between link linked relate related relation relationship reference references
-type kind instead rather just but too well simple basic complete proper`.split(/\s+/));
+type kind instead rather just but too well simple basic complete proper
+view views showing shows show listing lists displaying only`.split(/\s+/));
 
 const IRREGULAR = { person: "people", child: "children", man: "men", woman: "women", mouse: "mice", foot: "feet", tooth: "teeth", goose: "geese" };
 const UNCOUNTABLE = new Set(["staff", "media", "data", "news", "series", "equipment", "information", "inventory", "stock", "feedback", "software", "hardware"]);

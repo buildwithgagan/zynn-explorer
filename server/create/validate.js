@@ -44,6 +44,7 @@ export function constraintName(table, columns, suffix) {
 /** Every relation-level name in a schema: tables and indexes share one namespace. */
 export function relationNames(design, schema) {
   const names = new Set();
+  for (const v of Object.values(design.views ?? {})) if (v.schema === schema) names.add(v.name);
   for (const t of Object.values(design.tables)) {
     if (t.schema !== schema) continue;
     names.add(t.name);
