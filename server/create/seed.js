@@ -21,7 +21,7 @@ export function columnPlan(design, id) {
     const fk = table.fks.find((f) => f.columns.length === 1 && f.columns[0] === c.name);
     if (table.fks.some((f) => f.columns.length > 1 && f.columns.includes(c.name))) throw fail(`${table.name} has a multi-column foreign key, which sample data cannot fill yet`);
     if (fk) { plan.push({ column: c, source: "fk", fk }); continue; }
-    if (["now", "uuid"].includes(c.default?.kind) || c.default?.raw) continue;
+    if (["now", "now_plus", "uuid"].includes(c.default?.kind) || c.default?.raw) continue;
     if (c.type.enum) { plan.push({ column: c, source: "enum", values: design.enums[c.type.enum].values }); continue; }
     const isKey = table.pk?.columns.includes(c.name);
     if (isKey && ["smallint", "integer", "bigint"].includes(c.type.base)) { plan.push({ column: c, source: "sequence" }); continue; }

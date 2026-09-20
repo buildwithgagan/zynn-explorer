@@ -4,7 +4,7 @@ import { ARCHETYPES, archetypeByName, columnFromArchetype } from "./archetypes.j
 import { BLUEPRINTS, blueprintById, entitiesOf, instantiate } from "./blueprints/index.js";
 import { newId } from "./ops.js";
 import { safeName } from "./validate.js";
-import { typeLabel, defaultLabel } from "./types.js";
+import { typeLabel, defaultLabel, GENERATED } from "./types.js";
 import { stagedReply, noBlueprintReply, describeOp, DECLINES } from "./wording.js";
 
 // Natural language → ops, with Jev. Jev returns judgments, never text, so the shape is always:
@@ -16,6 +16,7 @@ const NONE = "__none__";
 const NEW = "__new__";
 const STATED = 0.6;    // something the request says
 const INFERRED = 0.85; // something the request only implies, or anything destructive
+const COMBINATION = 0.5; // a column in a unique combination: measured 0.71–0.92 for members, ≤ 0.41 for the rest, over six requests on two databases
 const OPTIONAL = 0.75; // an optional part of a blueprint: measured at ≥ 0.89 when asked for, ≤ 0.59 when not
 const MAX_TABLES = 150;
 const MAX_FIELDS = 16;
@@ -29,11 +30,12 @@ const OPS = {
   new_database: "Create a new, empty database on the server. Examples: 'create a database called shop', 'new db named testing'.",
   create_table: "Create one or more specific new tables, usually naming their fields. Examples: 'create a table called invoices with number and amount', 'add a suppliers table', 'create a roles table with name and description', 'a permissions table'.",
   add_columns: "Add one or more new columns or fields to a table that already exists. Examples: 'add a phone number to customers', 'patients also need date of birth and allergies'.",
-  change_column: "Change how an existing column behaves: the type of data it holds, whether it is required or optional, whether its values must be unique, or what value it gets by default. Examples: 'failed login count should default to 0', 'status defaults to active', 'make email required', 'phone should be optional', 'change price to a decimal', 'change quantity to a big whole number', 'turn notes into json', 'emails must be unique', 'billing email does not need to be unique'.",
+  change_column: "Change how an existing column behaves: the type of data it holds, whether it is required or optional, whether its values must be unique, or what value it gets by default. Examples: 'failed login count should default to 0', 'status defaults to active', 'expires at should default to 30 days from now', 'make email required', 'phone should be optional', 'change price to a decimal', 'change quantity to a big whole number', 'turn notes into json', 'emails must be unique', 'billing email does not need to be unique'.",
   rename_thing: "Give an existing table or column a different name. Examples: 'rename clients to customers', 'call the fullname column name instead'.",
   remove_thing: "Delete an existing table or column. Examples: 'drop the legacy table', 'remove the fax column from contacts', 'get rid of notes'.",
   relate_tables: "Create a new link between two tables that exist but are not linked yet: one belongs to the other, or they are many-to-many. Examples: 'orders belong to customers', 'each post has one author', 'posts can have many tags'.",
-  unique_together: "Several columns of one table must be unique in combination: a row may repeat each value, but not the same combination. Examples: 'one membership per user per organization', 'provider and provider user id together must be unique', 'plan names must be unique within a product', 'a user can review a product only once'.",
+  computed_column: "Add a column whose value is always calculated from other columns of the same row, so it never has to be filled in. Examples: 'add a line total to order items that is quantity times unit price', 'full name should be first name plus last name', 'add a duration that is ends at minus starts at', 'add a lowercase version of email'.",
+  unique_together: "Several columns of one table must be unique in combination: a row may repeat each value, but not the same combination. Examples: 'one membership per user per organization', 'provider and provider user id together must be unique', 'plan names must be unique within a product', 'a user can review a product only once'. Also changing or removing such a rule: 'memberships should be unique per organization, user and role instead', 'plan names no longer need to be unique within a product'.",
   on_delete: "Change what happens to linked rows when the row they belong to is deleted: delete them too, keep them and clear the link, or block the deletion. Examples: 'when a user is deleted keep their audit events', 'deleting a customer should delete their orders too', 'do not allow deleting a plan that has subscriptions'.",
   add_index: "Add an index to make lookups faster. Examples: 'index orders by created_at', 'add an index on email'.",
   seed_data: "Fill tables with sample, fake or test rows. Examples: 'add 50 fake rows', 'fill it with sample data', 'seed the customers table'.",
@@ -371,7 +373,15 @@ export async function interpret(request, baseline, draft, current) {
 
   const [aboutTables, aboutWording] = await Promise.all([reading.ask(state, tableQuestions(tables)), reading.ask({ request }, wordingQuestions(spans))]);
   const first = { ...aboutTables, ...aboutWording };
-  const op = reading.choice("op", "Kind of change", first.op, { labels: Object.fromEntries(Object.keys(OPS).map((k) => [k, k.replace(/_/g, " ")])) });
+  let op = reading.choice("op", "Kind of change", first.op, { labels: Object.fromEntries(Object.keys(OPS).map((k) => [k, k.replace(/_/g, " ")])) });
+  // "Unique" with a scope (within a product, per user, together, only once) is a combination, not one column. When Jev
+  // splits between exactly those two readings, the wording settles it.
+  const [top1, top2] = ranked(first.op);
+  if (top2 && new Set([top1.value, top2.value]).size === 2 && [top1.value, top2.value].every((v) => ["unique_together", "change_column"].includes(v))
+    && top1.p + top2.p >= INFERRED && /\b(within|per|together|combination|combined|only once|for each|in each|at most one|one .+ per)\b/i.test(request) && /\b(unique|once|one|duplicate|per)\b/i.test(request)) {
+    op = { value: "unique_together", p: top1.p + top2.p, ok: true };
+    reading.rule("op:scope", "Scope words", "a combination, not one column");
+  }
   if (!op.ok) {
     const [a, b] = ranked(first.op);
     return decline("I wasn't sure what kind of change that is. Try saying it more directly, for example:", {
@@ -665,9 +675,84 @@ export async function interpret(request, baseline, draft, current) {
     return done({ reply: { text: staged ? `Added ${built.columns.map((c) => c.name).join(", ")} to the ${t.label} table in the draft.` : stagedReply(added), notes }, added: added.map((o) => o.id) });
   }
 
+  if (op.value === "computed_column") {
+    const usable = t.table.columns.filter((c) => !c.generated && c.type.base).slice(0, 60);
+    const columnChoices = Object.fromEntries(usable.map((c) => [c.name, typeLabel(c.type)]));
+    const fresh = dropOverlaps(spans.filter((s) => !t.table.columns.some((c) => c.name === s.ident) && !existingByIdent(s.ident)));
+    if (!fresh.length) return decline(DECLINES.no_names);
+    const second = await reading.ask({ request }, {
+      formula: choice("`request` asks for a column that is calculated from other columns. What is the calculation?", {
+        multiply: "One column multiplied by another: times, multiplied by, the product of.",
+        add: "Two number columns added together: plus, the sum of.",
+        subtract: "One column minus another, or the time between two moments: minus, the difference, how long between, duration.",
+        concat: "Two pieces of text joined together, such as a full name from a first and a last name.",
+        lower: "The lowercase form of one text column.",
+        [NONE]: "A different kind of calculation.",
+      }),
+      first: choice(`Which existing column of "${t.label}" does the calculation read? If it reads two, give the first: for a subtraction the one subtracted from, for the time between two moments the later one.`, { ...columnChoices, [NONE]: "None of these." }),
+      second: choice(`Which column of "${t.label}" is the second value in the calculation? For a subtraction it is the one taken away; for the time between two moments it is the earlier one.`, { ...columnChoices, [NONE]: "There is no second column." }),
+      newname: choice("Which phrase in `request` is the name of the new, calculated column?", { ...Object.fromEntries(fresh.map((s) => [`s${s.order}`, `"${s.text}"`])), [NONE]: "None of these." }),
+    });
+    const formula = reading.choice("formula", "Calculation", second.formula, { labels: { multiply: "a × b", add: "a + b", subtract: "a − b", concat: "a joined with b", lower: "lowercase of a", [NONE]: "something else" } });
+    if (!formula.ok || formula.value === NONE) return decline("I can calculate a column as one column times, plus or minus another, the time between two moments, two texts joined, or the lowercase of a text. Anything else needs the SQL editor.");
+    const name = reading.choice("newname", "New column", second.newname, { labels: { ...Object.fromEntries(fresh.map((s) => [`s${s.order}`, s.ident])), [NONE]: "not found" } });
+    const span = name.ok && fresh.find((s) => `s${s.order}` === name.value);
+    if (!span) return decline("I couldn't find what to call the new column. Say it like: \"add a line total to order items that is quantity times unit price\".");
+    // Columns named outright are taken as said, in the order said.
+    const arity = GENERATED[formula.value].arity;
+    const said = dropOverlaps(spans.filter((s) => s !== span && usable.some((c) => c.name === s.ident))).sort((x, y) => x.run - y.run || x.start - y.start).map((s) => s.ident);
+    // "a minus b" says its own order, and "subtract b from a" says it reversed. "The time between a and b" does not, so Jev decides that.
+    const spoken = /\bminus\b|\bless\b/i.test(request) ? "as_said" : /\bsubtract(ed|ing)?\b.*\bfrom\b/i.test(request) ? "reversed" : null;
+    if (formula.value === "subtract" && spoken === "reversed") said.reverse();
+    const byRule = said.length === arity && (formula.value !== "subtract" || spoken);
+    if (byRule) said.forEach((c, i) => reading.rule(`in:${i}`, i ? "Second value" : "First value", c));
+    const a = byRule ? { ok: true, value: said[0] } : reading.choice("first", "First value", second.first, { labels: { [NONE]: "not found" } });
+    const b = arity === 2 ? (byRule ? { ok: true, value: said[1] } : reading.choice("second", "Second value", second.second, { labels: { [NONE]: "not found" } })) : null;
+    if (!a.ok || a.value === NONE || (b && (!b.ok || b.value === NONE))) return decline(`I couldn't match the columns to calculate from. ${t.label} has: ${usable.map((c) => c.name).join(", ")}.`);
+    if (b && a.value === b.value) return decline(`Both values came out as ${a.value}. Name the two columns, for example "quantity times unit price".`);
+    const made = [{ id: newId(), kind: "add_generated_column", table: t.id, name: safeName(span.ident), template: formula.value, columns: b ? [a.value, b.value] : [a.value] }];
+    ops.push(...made);
+    return done({ reply: { text: stagedReply(made), notes: ["Postgres calculates it for every row, existing ones included, and keeps it current. It cannot be written to directly."] }, added: [made[0].id] });
+  }
+
   if (op.value === "unique_together") {
-    const describe = (c) => { const fk = t.table.fks.find((f) => f.columns.includes(c.name)); return fk ? `which ${tables.find((p) => p.id === fk.refTable)?.label ?? "row"} it belongs to` : typeLabel(c.type); };
+    const describe = (c) => { const fk = t.table.fks.find((f) => f.columns.includes(c.name)); return fk ? `a reference to one row of "${tables.find((p) => p.id === fk.refTable)?.label ?? "another table"}"` : typeLabel(c.type); };
     const candidates = t.table.columns.filter((c) => !c.identity && !["created_at", "updated_at"].includes(c.name)).slice(0, 40);
+    // Rules that already exist on this table can be changed or removed, not only added.
+    const rules = t.table.uniques.filter((u) => u.columns.length > 1).slice(0, 12);
+    if (rules.length) {
+      const about = await reading.ask({ request }, {
+        ruleact: choice(`The table "${t.label}" already has rules that make a combination of columns unique. What does \`request\` ask for?`, {
+          new_rule: "A new, additional combination that must be unique. The existing rules are not mentioned.",
+          change_rule: "An existing rule should cover different columns: a column is added to it, taken out of it, or the combination is replaced ('instead', 'as well', 'no longer by').",
+          remove_rule: "An existing rule should stop applying, with nothing in its place ('no longer need to be unique', 'remove the rule', 'allow duplicates').",
+        }),
+        which: choice("Which existing rule is `request` about?", { ...Object.fromEntries(rules.map((u, i) => [`u${i}`, `The combination of ${u.columns.join(" and ")} must be unique`])), [NONE]: "None of these." }),
+      });
+      const act = reading.choice("ruleact", "Rule", about.ruleact, { labels: { new_rule: "a new rule", change_rule: "change a rule", remove_rule: "remove a rule" } });
+      if (act.ok && act.value !== "new_rule") {
+        const which = rules.length === 1 ? { ok: true, value: "u0" } : reading.choice("which", "Existing rule", about.which, { labels: { ...Object.fromEntries(rules.map((u, i) => [`u${i}`, u.columns.join(" + ")])), [NONE]: "none" }, bar: act.value === "remove_rule" ? INFERRED : STATED });
+        if (!which.ok || which.value === NONE) return decline(`I couldn't tell which rule you mean. ${t.label} has: ${rules.map((u) => u.columns.join(" + ")).join("; ")}.`);
+        const rule = rules[Number(which.value.slice(1))];
+        // A rule that is still only in the draft is an op; edit or remove that op instead of dropping something that does not exist yet.
+        const stagedAt = ops.findIndex((o) => o.kind === "add_unique" && o.table === t.id && o.columns.join() === rule.columns.join());
+        let columns = null;
+        if (act.value === "change_rule") {
+          const after = await reading.ask({ request, current_rule: rule.columns }, Object.fromEntries(candidates.map((c) => [`after:${c.name}`,
+            noul(`In the table "${t.label}" the combination \`current_rule\` must be unique, and \`request\` changes that rule. After the change, is the column "${c.name}" part of the combination?`)])));
+          columns = candidates.filter((c) => reading.noul(`after:${c.name}`, `Afterwards includes ${c.name}`, after[`after:${c.name}`]).ok).map((c) => c.name);
+          if (columns.length < 2) return decline(`After that change the rule would cover ${columns.length ? "only " + columns[0] : "no columns"}. A combination needs at least two; to drop the rule say "remove the rule".`);
+          if (columns.join() === rule.columns.join()) return decline(`That is already the rule: ${rule.columns.join(" + ")} must be unique in ${t.label}.`);
+        }
+        if (stagedAt >= 0) {
+          if (columns) ops[stagedAt].columns = columns; else ops.splice(stagedAt, 1);
+          return done({ reply: { text: columns ? `In the draft, the rule on ${t.label} now covers ${columns.join(" + ")}.` : `Removed the rule on ${rule.columns.join(" + ")} from the draft.` }, added: [] });
+        }
+        const made = [{ id: newId(), kind: "drop_constraint", table: t.id, name: rule.name }, ...(columns ? [{ id: newId(), kind: "add_unique", table: t.id, columns }] : [])];
+        ops.push(...made);
+        return done({ reply: { text: stagedReply(made), notes: columns ? [`The old rule (${rule.columns.join(" + ")}) is removed and the new one added in the same transaction, so there is no moment without a rule.`] : [] }, added: made.map((o) => o.id) });
+      }
+    }
     // Columns named outright are taken as said ("provider and provider user id together"): the longest phrase wins, so
     // "provider user id" does not also count as "user id". Jev is asked only when the wording is indirect ("per user").
     const named = dropOverlaps(spans.filter((s) => candidates.some((c) => c.name === s.ident))).map((s) => s.ident);
@@ -679,7 +764,7 @@ export async function interpret(request, baseline, draft, current) {
     }
     const second = await reading.ask({ request }, Object.fromEntries(candidates.map((c) => [`ucol:${c.name}`,
       noul(`\`request\` says that some columns of the table "${t.label}" must be unique in combination. Is the column "${c.name}" (${describe(c)}) one of the columns in that combination?`)])));
-    const columns = candidates.filter((c) => reading.noul(`ucol:${c.name}`, `Combination includes ${c.name}`, second[`ucol:${c.name}`]).ok).map((c) => c.name);
+    const columns = candidates.filter((c) => reading.noul(`ucol:${c.name}`, `Combination includes ${c.name}`, second[`ucol:${c.name}`], { bar: COMBINATION, quietBelow: 0.05 }).ok).map((c) => c.name);
     if (columns.length < 2) return decline(`I need at least two columns of ${t.label} for a combination${columns.length ? `, and only found ${columns[0]}` : ""}. It has: ${t.table.columns.map((c) => c.name).join(", ")}. For a single column, say "${columns[0] ?? "email"} must be unique".`);
     const made = [{ id: newId(), kind: "add_unique", table: t.id, columns }];
     ops.push(...made);
@@ -708,6 +793,11 @@ export async function interpret(request, baseline, draft, current) {
     defaults.false = [{ kind: "bool", value: false }, "False, no, off, disabled"];
     defaults.now = [{ kind: "now" }, "The current date and time, now, the moment the row is created"];
     defaults.today = [{ kind: "current_date" }, "Today's date"];
+    // "30 days from now": a default worked out from the moment the row is created.
+    for (const m of request.matchAll(/\b(\d{1,5}|an?|one)\s+(minute|hour|day|week|month|year)s?\s+(from now|from today|later|after|in the future|ahead|from creation|from when)/gi)) {
+      const amount = /^\d/.test(m[1]) ? Number(m[1]) : 1, unit = m[2].toLowerCase() + "s";
+      defaults[`in:${amount}:${unit}`] = [{ kind: "now_plus", amount, unit }, `${amount} ${unit} after the moment the row is created`];
+    }
     defaults.uuid = [{ kind: "uuid" }, "A newly generated random UUID"];
     defaults.empty_json = [{ kind: "empty_json" }, "An empty JSON object"];
     for (const c of t.table.columns) for (const v of draft.enums[c.type.enum]?.values ?? []) if (new RegExp(`\\b${v.replace(/_/g, "[ _-]")}\\b`, "i").test(request)) defaults[`e:${v}`] = [{ kind: "enum_label", value: v }, `The value "${v.replace(/_/g, " ")}"`];
@@ -770,13 +860,13 @@ export async function interpret(request, baseline, draft, current) {
   if (change.value === "make_optional") return stage([{ ...base, kind: "drop_not_null" }]);
   if (change.value === "remove_default") return stage([{ ...base, kind: "drop_default" }]);
   if (change.value === "set_default") {
-    const pick = reading.choice("defval", "Default value", second.defval, { labels: { ...Object.fromEntries(Object.keys(defaults).map((k) => [k, k.replace(/^[nes]:/, "")])), [NONE]: "not found" } });
-    if (!pick.ok || pick.value === NONE) return decline("I couldn't find the default value in your message. I can set a number, true or false, now, today, a new UUID, an empty JSON object, one of the column's allowed values, or text in quotes.");
+    const pick = reading.choice("defval", "Default value", second.defval, { labels: { ...Object.fromEntries(Object.entries(defaults).map(([k, [v]]) => [k, defaultLabel(v)])), [NONE]: "not found" } });
+    if (!pick.ok || pick.value === NONE) return decline("I couldn't find the default value in your message. I can set a number, true or false, now, today, a time from now (\"30 days from now\"), a new UUID, an empty JSON object, one of the column's allowed values, or text in quotes.");
     const value = defaults[pick.value][0];
     const column = t.table.columns.find((c) => c.name === col.value);
     // Whether a value suits a column's type is checkable, so it is checked here rather than asked.
     const base0 = column.type.base;
-    const fits = { number: ["smallint", "integer", "bigint", "numeric", "real", "double precision"], bool: ["boolean"], now: ["timestamptz", "timestamp"], current_date: ["date"], uuid: ["uuid"], empty_json: ["jsonb", "json"], string: ["text", "varchar"] }[value.kind];
+    const fits = { number: ["smallint", "integer", "bigint", "numeric", "real", "double precision"], bool: ["boolean"], now: ["timestamptz", "timestamp"], now_plus: ["timestamptz", "timestamp", "date"], current_date: ["date"], uuid: ["uuid"], empty_json: ["jsonb", "json"], string: ["text", "varchar"] }[value.kind];
     const ok = value.kind === "enum_label" ? draft.enums[column.type.enum]?.values.includes(value.value) : fits.includes(base0);
     if (!ok) return decline(`${defaultLabel(value)} is not a value that ${t.label}.${column.name} (${typeLabel(column.type)}) can hold.`);
     return stage([{ ...base, kind: "set_default", default: value }]);

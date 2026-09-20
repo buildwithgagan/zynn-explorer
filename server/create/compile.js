@@ -1,5 +1,5 @@
 import { quoteIdent, qualified, quoteLiteral } from "../db.js";
-import { typeSql, typeLabel, sameType, isSafeWidening, CHECKS, ON_DELETE, PRIVILEGES, POLICY_COMMANDS } from "./types.js";
+import { typeSql, typeLabel, sameType, isSafeWidening, CHECKS, ON_DELETE, PRIVILEGES, POLICY_COMMANDS, GENERATED, INTERVAL_UNITS } from "./types.js";
 import {
   OpError, checkNewIdent, constraintName, relationNames, constraintNames, getTable, getColumn, referenceable, checkFkTypes,
 } from "./validate.js";
@@ -31,6 +31,11 @@ function defaultSql(design, column, ctx) {
   if (!d) return null;
   switch (d.kind) {
     case "now": return "now()";
+    case "now_plus": {
+      if (!INTERVAL_UNITS.includes(d.unit)) throw new OpError("Unknown unit of time");
+      if (!["timestamptz", "timestamp", "date"].includes(column.type.base)) throw new OpError(`${column.name} is ${typeLabel(column.type)}, which cannot hold a moment in time`);
+      return `now() + interval '${Number(d.amount) | 0} ${d.unit}'`;
+    }
     case "current_date": return "CURRENT_DATE";
     case "uuid":
       if (design.versionNum < 130000) throw new OpError("gen_random_uuid() needs Postgres 13 or newer");
@@ -222,12 +227,36 @@ const STEPS = {
     return [{ kind: "drop_column", table: op.table, column: column.name }];
   },
 
+  add_generated_column(d, op, out) {
+    const t = getTable(d, op.table);
+    checkNewIdent(op.name, "column name");
+    if (t.columns.some((c) => c.name === op.name)) throw new OpError(`${t.name} already has a column "${op.name}"`);
+    if (d.versionNum < 120000) throw new OpError("Calculated columns need Postgres 12 or newer");
+    const g = Object.hasOwn(GENERATED, op.template ?? "") ? GENERATED[op.template] : null;
+    if (!g) throw new OpError("That calculation is not one Creator can write");
+    if (op.columns.length !== g.arity) throw new OpError(`That calculation needs ${g.arity} column${g.arity === 1 ? "" : "s"}`);
+    const inputs = op.columns.map((c) => getColumn(t, c));
+    if (inputs.some((c) => c.generated)) throw new OpError("A calculated column cannot be built from another calculated column");
+    const type = g.result(...inputs.map((c) => c.type.base));
+    if (!type) throw new OpError(`${inputs.map((c) => `${c.name} (${typeLabel(c.type)})`).join(" and ")} cannot be combined that way`);
+    t.columns.push({ name: op.name, type, nullable: true, default: null, identity: null, generated: true, generatedAs: { template: op.template, columns: [...op.columns] }, comment: null });
+    const big = t.estRows > BIG_TABLE;
+    out.push({
+      sql: `ALTER TABLE ${tableSql(t)} ADD COLUMN ${quoteIdent(op.name)} ${typeSql(type, enumSql(d))} GENERATED ALWAYS AS (${g.sql(...op.columns.map(quoteIdent))}) STORED;`,
+      level: big ? "caution" : "safe",
+      reason: big ? `Every row of ${t.name} is rewritten to fill it in; writes wait until that finishes` : "Postgres keeps it up to date; it cannot be written to directly",
+    });
+    return [{ kind: "drop_column", table: op.table, column: op.name }];
+  },
+
   drop_column(d, op, out) {
     const t = getTable(d, op.table);
     getColumn(t, op.column);
     if (t.pk?.columns.includes(op.column)) throw new OpError(`"${op.column}" is part of ${t.name}'s primary key`);
     const users = Object.values(d.tables).filter((o) => o.fks.some((f) => f.refTable === op.table && f.refColumns.includes(op.column)));
     if (users.length) throw new OpError(`${users.map((u) => u.name).join(", ")} reference${users.length === 1 ? "s" : ""} ${t.name}.${op.column}`);
+    const computed = t.columns.filter((c) => c.generatedAs?.columns.includes(op.column));
+    if (computed.length) throw new OpError(`${computed.map((c) => c.name).join(", ")} ${computed.length === 1 ? "is" : "are"} calculated from ${op.column}. Drop ${computed.length === 1 ? "that column" : "those"} first`);
     if (t.columns.length === 1) throw new OpError(`"${op.column}" is ${t.name}'s only column. Drop the table instead`);
     const uses = (k) => (k.columns ?? [k.column]).includes(op.column);
     t.columns = t.columns.filter((c) => c.name !== op.column);
@@ -247,6 +276,7 @@ const STEPS = {
     c.name = op.name;
     for (const k of [t.pk, ...t.fks, ...t.uniques, ...t.indexes]) if (k) k.columns = swap(k.columns);
     for (const k of t.checks) if (k.column === op.column) k.column = op.name;
+    for (const g of t.columns) if (g.generatedAs) g.generatedAs.columns = swap(g.generatedAs.columns);
     for (const o of Object.values(d.tables)) for (const f of o.fks) if (f.refTable === op.table) f.refColumns = swap(f.refColumns);
     return [{ kind: "rename_column", table: op.table, column: op.name, name: op.column }];
   },
@@ -258,6 +288,7 @@ const STEPS = {
     if (sameType(c.type, op.type)) throw new OpError(`${t.name}.${c.name} is already ${typeLabel(c.type)}`);
     const linked = t.fks.some((f) => f.columns.includes(c.name)) || Object.values(d.tables).some((o) => o.fks.some((f) => f.refTable === op.table && f.refColumns.includes(c.name)));
     if (linked) throw new OpError(`${t.name}.${c.name} is part of a foreign key. Both sides must keep the same type`);
+    if (t.columns.some((g) => g.generatedAs?.columns.includes(c.name))) throw new OpError(`${t.columns.find((g) => g.generatedAs?.columns.includes(c.name)).name} is calculated from ${c.name}. Drop that column first`);
     if (c.identity && !["smallint", "integer", "bigint"].includes(op.type.base)) throw new OpError("An identity column must stay a whole-number type");
     const safe = isSafeWidening(c.type, op.type);
     const previous = c.type;
@@ -386,9 +417,18 @@ const STEPS = {
       if (users.length) throw new OpError(`${users.map((u) => u.name).join(", ")} reference${users.length === 1 ? "s" : ""} this primary key`);
       t.pk = null;
     }
+    const unique = t.uniques.find((k) => k.name === op.name), fk = t.fks.find((k) => k.name === op.name), check = t.checks.find((k) => k.name === op.name);
+    const users = unique ? Object.values(d.tables).filter((o) => o.fks.some((f) => f.refTable === op.table && f.refColumns.join() === unique.columns.join())) : [];
+    if (users.length) throw new OpError(`${users.map((u) => u.name).join(", ")} reference${users.length === 1 ? "s" : ""} these columns through this rule`);
     for (const key of ["fks", "uniques", "checks"]) t[key] = t[key].filter((k) => k.name !== op.name);
-    out.push({ sql: `ALTER TABLE ${tableSql(t)} DROP CONSTRAINT ${quoteIdent(op.name)};`, level: "caution", reason: "The rule stops being enforced" });
-    return null;
+    out.push({ sql: `ALTER TABLE ${tableSql(t)} DROP CONSTRAINT ${quoteIdent(op.name)};`, level: "caution", reason: unique ? `${t.name} may then repeat the same ${unique.columns.join(" + ")}` : "The rule stops being enforced" });
+    // Undo re-creates the rule under Create's naming, so it is only offered where that gives the same name back.
+    const again = unique ? { kind: "add_unique", table: op.table, columns: unique.columns, name: constraintName(t.name, unique.columns, "key") }
+      : fk ? { kind: "add_fk", table: op.table, columns: fk.columns, refTable: fk.refTable, refColumns: fk.refColumns, onDelete: fk.onDelete, index: false, name: constraintName(t.name, fk.columns, "fkey") }
+      : check?.template ? { kind: "add_check", table: op.table, column: check.column, template: check.template, name: constraintName(t.name, [check.column], "check") } : null;
+    if (!again || again.name !== op.name || !["restrict", "cascade", "set_null", "no_action", undefined].includes(again.onDelete)) return null;
+    delete again.name;
+    return [again];
   },
 
   add_index(d, op, out) {
