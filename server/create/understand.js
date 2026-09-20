@@ -41,6 +41,7 @@ const OPS = {
   seed_data: "Fill tables with sample, fake or test rows. Examples: 'add 50 fake rows', 'fill it with sample data', 'seed the customers table'.",
   access: "Database-level access: Postgres roles and privileges for the people or services that connect to the database, or row-level security. Examples: 'create a read-only role called analyst', 'let the reporting role read orders', 'revoke delete from the app role', 'users should only see their own rows'. Not this: tables that store an application's own users, roles or permissions.",
   advise: "Review or critique the existing design and suggest improvements. Examples: 'review my schema', 'what should I improve', 'any problems with this design'.",
+  export_schema: "Get the schema or its migrations out as SQL files, to use somewhere else. Examples: 'export the schema', 'give me the sql for this database', 'download the migrations', 'I need a schema.sql file'.",
   data_question: "A question about the data stored in the tables, not a change to their structure. Examples: 'how many orders last month', 'show me the top customers'.",
   other: "None of the above: not a request about this database.",
 };
@@ -159,6 +160,12 @@ function dropRestatements(fields, tableNames) {
     return !forms.flatMap((x) => [x, singularize(x)]).some((x) => x !== f.ident && names.has(x));
   });
 }
+
+// Words that carry a sentence rather than name something. A leftover made only of these is not worth reporting.
+const CONNECTIVE = new Set(`deleted delete deletes removed kept keep cleared link links linked belongs belong each every too also when their its his her
+them they must be been is are was unique required optional mandatory together once only again same other another own per within without
+true false yes no flag version kind sort thing things stuff etc so that this these those which who whose what where then than there here
+say says said mean means meant like such plus well just really very quite please thanks`.split(/\s+/));
 
 /** Whether every occurrence of `text` in the request sits inside a bracketed list. */
 function inBrackets(request, text) {
@@ -390,6 +397,7 @@ export async function interpret(request, baseline, draft, current) {
   }
   if (op.value === "other") return decline(DECLINES.other);
   if (op.value === "data_question") return decline(DECLINES.data_question, { askInstead: request });
+  if (op.value === "export_schema") return done({ reply: { text: "The files are in the History tab: schema.sql is the whole schema as it stands now and runs on an empty database; the migrations download has one numbered file per change applied from this page. Sample data is noted in them but not reproduced." }, focus: "history" });
   if (op.value === "advise") return done({ reply: { text: "I reviewed the draft as it stands. The findings are in the Advisor tab, most with a one-click fix." }, focus: "advisor" });
 
   const existingByIdent = (ident) => tables.find((t) => [ident, tableIdent(ident), singularize(ident)].includes(t.table.name));
@@ -402,6 +410,19 @@ export async function interpret(request, baseline, draft, current) {
     .map((s) => ({ ...s, role: listed.has(s.ident) ? { value: "example_value", p: 1 } : existingByIdent(s.ident) ? { value: "table_name", p: 1 } : top(first[`span:${s.order}`]) }))
     .filter((s) => s.role.p >= STATED);
   const of = (role) => dropOverlaps(roles.filter((s) => s.role.value === role));
+  // What a confident-looking answer can hide: a phrase that was given no role at all and so went nowhere. When a request
+  // builds or extends a table, those phrases are named, so a dropped field is visible instead of silent.
+  const unusedNote = (tableLabel, alsoUsed = []) => {
+    const touches = (a, b) => a.run === b.run && a.start < b.end && b.start < a.end;
+    // A phrase confidently judged to be nothing, or a fragment, was understood as unusable, which is exactly what to report.
+    const understood = roles.filter((r) => ![NONE, "fragment"].includes(r.role.value));
+    const leftover = dropOverlaps(spans.filter((s) => ![...understood, ...alsoUsed].some((r) => touches(r, s)) && !listed.has(s.ident) && !(listed.size && inBrackets(request, s.text))))
+      .filter((s) => !existingByIdent(s.ident) && !s.ident.split("_").every((w) => CONNECTIVE.has(w) || w.length < 2)).slice(0, 5);
+    if (!leftover.length) return null;
+    const quoted = leftover.map((s) => `"${s.text}"`);
+    const listing = quoted.length === 1 ? quoted[0] : `${quoted.slice(0, -1).join(", ")} and ${quoted.at(-1)}`;
+    return `I didn't use ${listing}. If ${leftover.length === 1 ? "that was" : "those were"} meant as ${leftover.length === 1 ? "a field" : "fields"}, say ${leftover.length === 1 ? "it" : "them"} again on ${leftover.length === 1 ? "its" : "their"} own: "add … to ${tableLabel}".`;
+  };
   const tableSpans = of("table_name"), valueSpans = of("example_value");
   const fieldSpans = dropRestatements(of("field_name"), tableSpans.map((s) => tableIdent(s.ident))).slice(0, MAX_FIELDS);
   for (const s of [...tableSpans, ...fieldSpans, ...valueSpans, ...of("role_name"), ...of("database_name")]) {
@@ -487,7 +508,8 @@ export async function interpret(request, baseline, draft, current) {
     const q = {};
     fieldQuestions(q, fieldSpans);
     valueQuestions(q, valueSpans, fieldSpans);
-    if (names.length > 1) fieldSpans.forEach((f, i) => { q[`owner:${i}`] = choice(`\`request\` describes several new tables. Which one does the field "${f.text}" belong to?`, Object.fromEntries(names.map((n) => [n, `The table ${n}`]))); });
+    // Asked per table, not as a choice between them: "members have a name … each class has a name" gives both a name.
+    if (names.length > 1) fieldSpans.forEach((f, i) => names.forEach((n) => { q[`has:${i}:${n}`] = noul(`\`request\` describes several new tables. According to it, does the table "${n}" have the field "${f.text}"?`); }));
     const parties = [...names, ...parents];
     const pairs = [];
     for (let a = 0; a < parties.length; a++) for (let b = a + 1; b < parties.length; b++) if (a < names.length && pairs.length < 15) pairs.push([parties[a], parties[b]]);
@@ -498,10 +520,17 @@ export async function interpret(request, baseline, draft, current) {
     const second = Object.keys(q).length ? await reading.ask({ request }, q) : {};
 
     const schema = defaultSchema(draft);
-    const owners = fieldSpans.map((f, i) => (names.length === 1 ? names[0] : (() => { const o = reading.choice(`owner:${i}`, `${f.ident} belongs to`, second[`owner:${i}`]); return o.ok ? o.value : names[0]; })()));
+    const owners = fieldSpans.map((f, i) => {
+      if (names.length === 1) return [names[0]];
+      const scored = names.map((n) => ({ n, p: second[`has:${i}:${n}`]?.noul ?? 0 })).sort((a, b) => b.p - a.p);
+      const yes = scored.filter((x) => x.p >= STATED);
+      for (const x of yes) reading.noul(`has:${i}:${x.n}`, `${x.n} has ${f.ident}`, { noul: x.p });
+      // Nothing cleared the bar: it still belongs somewhere, so it goes to the likeliest table rather than being dropped.
+      return (yes.length ? yes : scored.slice(0, 1)).map((x) => x.n);
+    });
     const made = [], allEnums = [], weak = [];
     for (const name of names) {
-      const mine = fieldSpans.map((f, i) => ({ f, i })).filter(({ i }) => owners[i] === name);
+      const mine = fieldSpans.map((f, i) => ({ f, i })).filter(({ i }) => owners[i].includes(name));
       const sub = Object.fromEntries(Object.entries(second).map(([k, v]) => [k, v]));
       const remap = (prefix) => mine.forEach(({ i }, n) => { sub[`${prefix}:${n}`] = second[`${prefix}:${i}`]; });
       ["arch", "req", "uniq"].forEach(remap);
@@ -543,6 +572,8 @@ export async function interpret(request, baseline, draft, current) {
     const notes = [];
     if (!fieldSpans.length) notes.push("You didn't name any fields, so I started with a name column. Tell me what else it should store.");
     if (weak.length) notes.push(`I wasn't sure what kind of value ${weak.join(", ")} hold${weak.length === 1 ? "s" : ""}, so ${weak.length === 1 ? "it is" : "they are"} plain text for now. Change the type in the Changes tab if that's wrong.`);
+    const unused = unusedNote(names[0]);
+    if (unused) notes.push(unused);
     return done({
       reply: { text: stagedReply(added), notes }, added: added.map((o) => o.id),
       suggestions: suggestions.map((s) => ({ label: s.label, ops: s.relation.kind ? [s.relation] : [{ id: newId(), kind: "add_column", table: s.relation.child, column: s.relation.column }] })),
@@ -671,6 +702,8 @@ export async function interpret(request, baseline, draft, current) {
     const added = [...built.enums, ...addColumns(ops, baseline, t.id, built.columns)];
     const notes = [];
     if (relaxed.length) notes.push(`${relaxed.join(", ")} would normally be required, but ${t.label} may already hold rows that have no value for ${relaxed.length === 1 ? "it" : "them"}. I left ${relaxed.length === 1 ? "it" : "them"} optional: fill the existing rows, then ask me to make ${relaxed.length === 1 ? "it" : "them"} required.`);
+    const unusedHere = unusedNote(t.label, fields);
+    if (unusedHere) notes.push(unusedHere);
     if (built.weak.length) notes.push(`I wasn't sure what kind of value ${built.weak.join(", ")} hold${built.weak.length === 1 ? "s" : ""}, so ${built.weak.length === 1 ? "it is" : "they are"} plain text for now.`);
     return done({ reply: { text: staged ? `Added ${built.columns.map((c) => c.name).join(", ")} to the ${t.label} table in the draft.` : stagedReply(added), notes }, added: added.map((o) => o.id) });
   }

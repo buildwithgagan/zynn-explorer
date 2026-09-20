@@ -353,6 +353,9 @@ test("the advisor finds what a DBA would, and each fix compiles", () => {
   assert.deepEqual(rules, ["duplicate_index", "fk_index", "float_money", "missing_fk", "no_pk", "nullable_boolean", "rls_no_policy", "table_plural", "text_enum", "timestamp_tz", "varchar_255"]);
   assert.equal(found[0].severity, "high");
   for (const f of found) assert.deepEqual(build(f.ops, d).broken, [], f.rule);
+  // A calculated yes/no column is not a "nullable boolean" to fix: its value follows from its inputs.
+  const withFlag = build([{ kind: "add_generated_column", table: "public.customers", name: "is_new", template: "when", condition: { column: "status", test: "eq", value: { text: "new" } } }], d).draft;
+  assert.ok(!advise(withFlag).some((f) => f.target.endsWith(".is_new")));
   const fixed = build(found.flatMap((f) => (f.rule === "table_plural" ? [] : f.ops)), d).draft;
   assert.deepEqual(advise(fixed).map((f) => f.rule).sort(), ["rls_no_policy", "table_plural"]);
 });
@@ -402,4 +405,41 @@ test("wording: every op reads as a sentence", () => {
   assert.equal(describeOp(cleanOp(SHOP[0])), "Create table customers with name and email");
   assert.equal(describeOp(cleanOp({ kind: "grant", role: "analyst", privileges: ["select"], allIn: "public" })), "Let analyst select every table in public");
   assert.equal(summarizeOps(cleanOps(SHOP)), "Create 2 tables: customers and orders");
+});
+
+test("the schema exports as SQL that names everything, and migrations as numbered files in a tar", async () => {
+  const { schemaSql, migrationFiles, tar } = await import("../server/create/export.js");
+  const { ops } = instantiate(BLUEPRINTS.find((b) => b.id === "hr"), { optional: new Set(["salaries"]) });
+  const design = build([...ops, { kind: "add_generated_column", table: "public.salaries", name: "monthly", template: "divide", columns: ["amount"], constant: 12 },
+    { kind: "create_role", name: "hr_reader" }, { kind: "grant", role: "hr_reader", privileges: ["SELECT"], table: "public.employees" }]).draft;
+  const sql = schemaSql(design, { at: new Date(0) });
+  assert.match(sql, /^-- shop: schema as of 1970-01-01T00:00:00.000Z/);
+  // Parents before children, enums before the tables that use them, and the self-reference inside its own table.
+  assert.ok(sql.indexOf('CREATE TYPE "public"."leave_request_kind"') < sql.indexOf('CREATE TABLE "public"."leave_requests"'));
+  assert.ok(sql.indexOf('CREATE TABLE "public"."departments"') < sql.indexOf('CREATE TABLE "public"."employees"'));
+  assert.match(sql, /"manager_id" bigint,[\s\S]*FOREIGN KEY \("manager_id"\) REFERENCES "public"\."employees" \("id"\) ON DELETE SET NULL/);
+  assert.match(sql, /"id" bigint GENERATED ALWAYS AS IDENTITY,/);
+  assert.match(sql, /CONSTRAINT "employees_email_check" CHECK \("email" = lower\("email"\)\)/);
+  assert.match(sql, /CREATE INDEX "employees_department_id_idx" ON "public"\."employees" \("department_id"\);/);
+  // Roles are cluster-wide: what depends on them is written out, but commented.
+  assert.match(sql, /COMMIT;\n[\s\S]*-- CREATE ROLE "hr_reader" NOLOGIN;\n-- GRANT USAGE ON SCHEMA "public" TO "hr_reader";\n-- GRANT SELECT ON "public"\."employees" TO "hr_reader";/);
+
+  const files = migrationFiles([
+    { at: "2026-09-20T10:05:00Z", summary: "Add 25 sample rows to every table", sql: ["-- sample data: 25 rows each into users (seed 7)"] },
+    { at: "2026-09-20T10:00:00Z", summary: "Create 2 tables: users and sessions", sql: ['CREATE TABLE "public"."users" ();', 'CREATE TABLE "public"."sessions" ();'] },
+  ], "zynn");
+  assert.deepEqual(files.map((f) => f.name), ["0001_create_2_tables_users_and_sessions.sql", "0002_add_25_sample_rows_to_every_table.sql"]);
+  assert.match(files[0].content, /^-- zynn: migration 1 of 2\n[\s\S]*BEGIN;\n\nCREATE TABLE "public"\."users" \(\);\n\nCREATE TABLE "public"\."sessions" \(\);\n\nCOMMIT;\n$/);
+  assert.ok(!files[1].content.includes("BEGIN;") && files[1].content.includes("not reproduced here"));
+
+  const archive = tar(files, 0);
+  assert.equal(archive.length % 512, 0);
+  const text = new TextDecoder().decode(archive);
+  assert.ok(text.startsWith("0001_create_2_tables_users_and_sessions.sql\0"));
+  assert.equal(text.slice(257, 262), "ustar");
+  const size = parseInt(text.slice(124, 135), 8);
+  assert.equal(new TextDecoder().decode(archive.slice(512, 512 + size)), files[0].content);
+  // The checksum is the byte sum of the header with the checksum field read as spaces.
+  const head = archive.slice(0, 512), stored = parseInt(text.slice(148, 154), 8);
+  assert.equal(head.reduce((a, b, i) => a + (i >= 148 && i < 156 ? 32 : b), 0), stored);
 });

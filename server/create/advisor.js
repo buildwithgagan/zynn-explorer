@@ -50,6 +50,8 @@ export function advise(design, values = {}) {
     }
 
     for (const c of t.columns) {
+      // A calculated column follows from its inputs: there is nothing to retype, default or require, so nothing to advise.
+      if (c.generated) continue;
       const at = `${id}.${c.name}`;
       const label = `${t.name}.${c.name}`;
       const inFk = t.fks.some((f) => f.columns.includes(c.name));

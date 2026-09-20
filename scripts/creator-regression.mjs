@@ -14,7 +14,7 @@ const CASES = [
   ["I need a blog with tags and comments", /create_table:posts.*create_table:post_tags.*create_table:comments/],
   ["design an HR database", /create_table:departments.*create_table:employees/],
   ["create a table called invoices with number, amount, due date and status (draft, sent, paid)", /create_enum:invoice_status create_table:invoices\[number,amount,due_date,status\]/],
-  ["create tables for members and gym classes. each gym class has a name and a capacity. members have a name and an email", /create_table:members.*create_table:gym_classes|create_table:gym_classes.*create_table:members/],
+  ["create tables for members and gym classes. each gym class has a name and a capacity. members have a name and an email", /^(create_table:members\[name,email\] create_table:gym_classes\[name,capacity\]|create_table:gym_classes\[name,capacity\] create_table:members\[name,email\])$/],
   ["add a loyalty points field and a birthday to customers", /^add_column:customers\.loyalty_points add_column:customers\.birthday$/],
   ["customers also need a required vat number", /^add_column:customers\.vat_number$/],
   ["make the sku on products optional", /^drop_not_null:products\.sku$/],
@@ -65,6 +65,7 @@ const CASES = [
   // Changing and removing a combination rule. The third item stages a rule first; the whole draft is compared.
   ["reviews should be unique per product, customer and rating instead", /^add_unique:reviews\(product_id,customer_id,rating\)$/, [{ id: "rule", kind: "add_unique", table: "public.reviews", columns: ["product_id", "customer_id"] }]],
   ["a customer no longer needs to be limited to one review per product, remove that rule", /^$/, [{ id: "rule", kind: "add_unique", table: "public.reviews", columns: ["product_id", "customer_id"] }]],
+  ["export the schema as sql", null],
   ["review my schema", null],
   ["how many orders were placed last month", null],
   ["asdf qwerty lorem", null],
@@ -76,7 +77,7 @@ const post = async (path, body) => (await fetch(base + path, { method: "POST", h
 const sig = (o) => {
   const t = (id) => String(id ?? "").split(".").pop();
   switch (o.kind) {
-    case "create_table": return `create_table:${o.name}${o.columns.some((c) => !c.ref) && ["invoices", "tickets"].includes(o.name) ? `[${o.columns.map((c) => c.name)}]` : ""}`;
+    case "create_table": return `create_table:${o.name}${o.columns.some((c) => !c.ref) && ["invoices", "tickets", "members", "gym_classes"].includes(o.name) ? `[${o.columns.map((c) => c.name)}]` : ""}`;
     case "add_column": return `add_column:${t(o.table)}.${o.column.name}`;
     case "rename_column": return `rename_column:${t(o.table)}.${o.column}>${o.name}`;
     case "rename_table": return `rename_table:${t(o.table)}>${o.name}`;

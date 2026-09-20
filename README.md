@@ -204,6 +204,19 @@ page. If the schema changed since the preview, Apply refuses and shows the refre
 migrations are logged in `migrations.local.json` (git-ignored, this machine only); the latest one can be
 undone from **History** when every step is reversible.
 
+**Taking the design elsewhere.** History has two downloads ("export the schema" in the chat leads there).
+`<database>_schema.sql` is the whole schema as it stands now, written from the live catalog in an order that runs on an
+empty database: schemas, enums, tables parents-first with their keys, rules, links and indexes, comments; roles are
+cluster-wide, so the grants, policies and `CREATE ROLE` lines come last, commented. `<database>_migrations.tar` holds one
+numbered `.sql` file per migration applied from this page, each wrapped in a transaction; sample data is noted in them
+but not reproduced. The schema file is the source of truth: it also covers changes made outside Create, which the
+migrations cannot know about. Nothing in either file is executed by the app.
+
+**Nothing dropped silently.** When a request builds or extends a table, any phrase that ended up with no role at all is
+named at the end of the reply ("I didn't use "whatever marketing wants" …"), so a field that was not understood is
+visible instead of quietly missing. A field named once for several new tables ("members have a name … each class has a
+name") goes to each of them.
+
 ### How Create works with Jev
 
 Jev cannot write SQL or invent a name, so, as in Ask, code proposes and Jev selects:
@@ -301,7 +314,7 @@ current time, and defaults other than a number, true/false, now, today, a time f
 JSON object, an allowed value or quoted text. For those, **Open in SQL editor**. Identity columns need Postgres 10+, `gen_random_uuid()` 13+.
 
 To re-check Jev's readings after changing a question or threshold, connect the app to a scratch database
-with the online-store blueprint applied and run `node scripts/creator-regression.mjs` (55 requests × 3,
+with the online-store blueprint applied and run `node scripts/creator-regression.mjs` (56 requests × 3,
 reports flips). `node scripts/creator-ask.mjs "…"` prints how one request was read. `node scripts/creator-blueprints-live.mjs` dry-runs every blueprint plus sample data.
 
 ## Layout
@@ -330,6 +343,7 @@ server/create/blueprints/   declarative whole-domain designs
 server/create/advisor.js    schema review rules (no model)
 server/create/seed.js       FK-consistent sample data
 server/create/apply.js      trial run + one-transaction apply; history.js logs it
+server/create/export.js     schema.sql and numbered migration files (as a tar), for taking the design elsewhere
 server/create/wording.js    everything Create says
 public/                no-build vanilla JS frontend (create.js, erd.js and chat.js are shared by Ask, Relationships and Create)
 test/                  node --test (compiler, injection, dates, candidates, assistant wording, follow-ups; create.test.js covers the Creator engine)

@@ -106,7 +106,6 @@ export async function loadDesign() {
       if (!c.generated) continue;
       const as = parseCatalogGenerated(c.generatedExpr, names);
       if (as) c.generatedAs = as;
-      delete c.generatedExpr;
     }
   }
   for (const k of constraints) {

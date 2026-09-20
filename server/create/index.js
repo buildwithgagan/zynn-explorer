@@ -11,6 +11,7 @@ import { describeOp, CONVENTIONS } from "./wording.js";
 import { BLUEPRINTS } from "./blueprints/index.js";
 import { TYPES } from "./types.js";
 import * as history from "./history.js";
+import { schemaSql, migrationFiles, tar } from "./export.js";
 
 const fail = (status, message) => Object.assign(new Error(message), { status });
 
@@ -125,4 +126,16 @@ const STARTERS = {
 
 export function starters() {
   return BLUEPRINTS.map((b) => ({ id: b.id, title: b.title, say: STARTERS[b.id] ?? `Design a database for ${b.title.toLowerCase()}` }));
+}
+
+/** The schema as it stands, and every migration applied from here, as files to take elsewhere. */
+export async function exportSql() {
+  const design = await loadDesign();
+  const files = migrationFiles(await history.list(history.databaseKey(db.connectionInfo())), design.database);
+  return {
+    database: design.database,
+    schema: { name: `${design.database}_schema.sql`, content: schemaSql(design) },
+    migrations: files.map((f) => f.name),
+    archive: files.length ? { name: `${design.database}_migrations.tar`, base64: Buffer.from(tar(files)).toString("base64") } : null,
+  };
 }
