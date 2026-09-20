@@ -1,4 +1,5 @@
 import { query, connectionInfo, quoteIdent } from "../db.js";
+import { invalidateDesign } from "../create/design.js";
 
 const TTL_MS = 5 * 60_000; // invalidated on connect, database switch and writes
 const MAX_CATEGORY_VALUES = 25;
@@ -6,6 +7,7 @@ let cache = null;
 
 export function invalidateModel() {
   cache = null;
+  invalidateDesign(); // Creator's picture of the schema goes stale at exactly the same moments
 }
 
 function category(typcategory, typtype, typname) {

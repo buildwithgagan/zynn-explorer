@@ -73,6 +73,7 @@ Remove it with `docker rm -f pgx-test`.
 | SQL | Editor with run-selection, EXPLAIN / EXPLAIN ANALYZE, history, error positions. Read-only transaction unless "Allow writes" is ticked |
 | Server | Activity and locks (auto-refresh), roles, settings (filter, changed-only), databases, sequences, types and enums |
 | Ask | Natural-language querying (below) |
+| Create | Natural-language schema design: draft, preview, apply (below) |
 
 ## Ask: the assistant
 
@@ -177,6 +178,80 @@ Low-cardinality text values come from `pg_stats`. On a database that was never A
 16 MB are sampled directly instead (row count plus up to 26 distinct values of each short text column), so
 status-like values still work; larger unanalyzed tables need `ANALYZE`.
 
+## Create: the database designer
+
+Describe what you need in plain English and Create drafts it: a whole schema ("build me a database for a
+vet clinic"), a table ("create a table called invoices with number, amount, due date and status (draft,
+sent, paid)"), or a change to what exists ("make phone optional", "orders belong to customers", "index
+orders by placed at", "create a read-only role called analyst", "fill every table with 50 sample rows",
+"review my schema"). **New database** creates one on the connected server and opens it.
+
+Nothing touches the database while you talk. Every request adds to a **draft**, shown four ways:
+
+- **Diagram**: the schema as it would be, with added, changed and dropped parts coloured.
+- **Changes**: each staged change in the order it will run, with its warnings. Tables still in the draft
+  can be edited in place (types, required, unique, remove a column) and each design convention is a switch.
+- **SQL**: the exact migration.
+- **Advisor**: a DBA's review of the draft: missing primary keys, foreign keys without an index, timestamps
+  without a time zone, money stored as floats, `varchar(255)`, nullable booleans, `_id` columns with no
+  constraint, duplicate indexes, row-level security with no policy, naming. Most findings have a one-click fix.
+
+**Apply** first runs the whole migration and rolls it back (a trial run, so a NOT NULL that would fail on
+existing rows is caught before anything changes), then asks for confirmation, then runs it as **one
+transaction**: all of it lands or none of it does. A migration that deletes data (drop table, drop column,
+a narrowing type change) requires typing the database name, and the server enforces that, not just the
+page. If the schema changed since the preview, Apply refuses and shows the refreshed draft. Applied
+migrations are logged in `migrations.local.json` (git-ignored, this machine only); the latest one can be
+undone from **History** when every step is reversible.
+
+### How Create works with Jev
+
+Jev cannot write SQL or invent a name, so, as in Ask, code proposes and Jev selects:
+
+1. **Read** (two parallel requests). One sees the request and the existing tables and decides the kind of
+   change, the target table and which tables are involved. The other sees *only the request* and decides
+   what each phrase in it is (table name, field name, allowed value, role name, …) and which blueprint
+   fits. They are separate because state leaks: with an online store's tables in view, "a database for
+   a vet clinic" was judged to be an online store.
+2. **Detail** (one request). Everything the chosen kind of change needs, asked at once: what kind of field
+   each name is (one of ~30 *archetypes*), whether it was said to be required or unique, how two tables
+   relate and what happens on delete, which optional parts of a blueprint were asked for, and so on.
+3. **Compile**. Code turns the answers into ops, replays them on the live schema, and emits SQL.
+
+The expertise is code, not model output. An **archetype** (`server/create/archetypes.js`) fixes what a DBA
+would do with a field: `email` is `text`, unique, lowercase-checked; `money` is `numeric(12,2)` and
+non-negative; a status with listed values becomes an enum with a default. **Conventions** give every
+table a `bigint` identity key and `timestamptz` audit columns, and index every foreign key. **Blueprints**
+(`server/create/blueprints/`) are ten declarative domain designs (store, blog, CRM, SaaS, clinic/booking,
+inventory, courses, helpdesk, HR, ledger); Jev picks one, picks its optional parts, and maps the user's own
+words onto its entities ("pets" for patients). Names that settle the question (`*_at`, `is_*`, `price`)
+are decided by rule and shown as such.
+
+Thresholds follow the same principle as Ask: 0.6 for something the request states, 0.85 for something
+it only implies (cascade on delete, many-to-many) and for anything destructive, 0.75 for a blueprint's
+optional parts (measured: ≥ 0.89 when asked for, ≤ 0.59 when not). Below the bar a change is offered as a
+suggestion and never staged.
+
+**Safety.** A draft is a list of ops, and the browser's copy is untrusted: every view and every apply
+rebuilds each op field by field (`ops.js`), replays it on the live schema and recompiles. SQL is assembled
+only from quoted identifiers, quoted literals and whitelists of types, actions, privileges and
+check/default/policy templates; there is no free SQL expression anywhere in an op. New names must be
+plain snake_case, not reserved, at most 63 bytes. Roles are always created `NOLOGIN`: a password never
+passes through the chat or the model. Only the request text and table, column and role names go to TypeSafe.
+
+### Limits
+
+Jev selects; it cannot invent. A name must appear in your message or in a blueprint, so "a table for the
+things people buy" gets a question back, not a guess. One kind of change per message. Domains outside the
+ten blueprints start as plain named tables for you to fill in. Sample data is plausible, not realistic,
+and triggers or hand-written checks on existing tables can reject it (the trial run says which). Not
+covered: views, functions, triggers, partitioning, composite foreign keys, converting existing data to an
+enum. For those, **Open in SQL editor**. Identity columns need Postgres 10+, `gen_random_uuid()` 13+.
+
+To re-check Jev's readings after changing a question or threshold, connect the app to a scratch database
+with the online-store blueprint applied and run `node scripts/creator-regression.mjs` (25 requests × 3,
+reports flips). `node scripts/creator-blueprints-live.mjs` dry-runs every blueprint plus sample data.
+
 ## Layout
 
 ```
@@ -191,6 +266,19 @@ server/nl/index.js     the questions, and assembling answers into a plan
 server/nl/assistant.js answer wording, catalog/structure answers, schema-tailored suggestions
 server/nl/followup.js  conversation context: validating it, describing it to Jev, merging a follow-up
 server/nl/compile.js   plan → parameterized SQL
-public/                no-build vanilla JS frontend
-test/                  node --test (compiler, injection, dates, candidates, assistant wording, follow-ups)
+server/create/design.js     the schema as plain JSON, read from the catalog; diagram diff; fingerprint
+server/create/ops.js        the op vocabulary; rebuilds untrusted ops field by field
+server/create/compile.js    replays ops on the design → validated draft + SQL + inverse ops
+server/create/types.js      whitelists: column types, defaults, checks, FK actions, privileges, policies
+server/create/validate.js   identifier rules, name generation, FK checks
+server/create/understand.js the Jev questions for Create, and turning answers into ops
+server/create/access.js     roles, grants and row-level security by natural language
+server/create/archetypes.js field archetypes: type, constraints, default, sample-data generator
+server/create/blueprints/   declarative whole-domain designs
+server/create/advisor.js    schema review rules (no model)
+server/create/seed.js       FK-consistent sample data
+server/create/apply.js      trial run + one-transaction apply; history.js logs it
+server/create/wording.js    everything Create says
+public/                no-build vanilla JS frontend (create.js, erd.js and chat.js are shared by Ask, Relationships and Create)
+test/                  node --test (compiler, injection, dates, candidates, assistant wording, follow-ups; create.test.js covers the Creator engine)
 ```

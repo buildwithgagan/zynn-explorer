@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import * as db from "./db.js";
 import * as introspect from "./introspect.js";
 import * as nl from "./nl/index.js";
+import * as create from "./create/index.js";
 import * as saved from "./saved.js";
 import { invalidateModel } from "./nl/model.js";
 import { isConfigured as jevConfigured } from "./jev.js";
@@ -99,6 +100,17 @@ app.post("/api/nl/ask", route(async (req) => {
 
 app.get("/api/nl/suggestions", route(() => nl.suggestions()));
 app.post("/api/nl/rerun", route((req) => nl.rerun(req.body?.plan)));
+
+// Creator: natural-language schema design. A draft is a list of ops; nothing reaches the database before /apply.
+app.post("/api/create/interpret", route((req) => create.interpret(req.body)));
+app.post("/api/create/draft/compile", route((req) => create.compile(req.body)));
+app.post("/api/create/apply", route((req) => create.apply(req.body)));
+app.post("/api/create/database", route((req) => create.createDatabase(req.body)));
+app.post("/api/create/advise", route((req) => create.advise(req.body)));
+app.post("/api/create/seed", route((req) => create.seed(req.body)));
+app.get("/api/create/history", route(() => create.listHistory()));
+app.post("/api/create/undo", route((req) => create.undo(req.body)));
+app.get("/api/create/starters", route(() => create.starters()));
 
 app.listen(PORT, HOST, async () => {
   console.log(`Zynn Explorer → http://localhost:${PORT}`);

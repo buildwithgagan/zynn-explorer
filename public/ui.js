@@ -84,7 +84,7 @@ export const KIND_NAMES = { r: "table", p: "partitioned table", v: "view", m: "m
 
 const escapeHtml = (s) => s.replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 const SQL_TOKEN = new RegExp(
-  "(--[^\\n]*)|('(?:[^']|'')*')|(&quot;(?:(?!&quot;).)*&quot;)|\\b(select|from|where|and|or|not|null|is|in|as|on|join|left|right|inner|outer|full|cross|lateral|group|order|by|having|limit|offset|union|all|distinct|case|when|then|else|end|create|table|view|materialized|index|unique|primary|key|foreign|references|constraint|default|check|insert|into|values|update|set|delete|returning|with|asc|desc|nulls|last|first|ilike|like|between|exists|function|returns|language|trigger|before|after|for|each|row|execute|begin|commit|rollback|explain|analyze|generated|always|identity|stored|partition|comment|alter|drop|grant|revoke|using|cascade|count|sum|avg|min|max|date_trunc|coalesce)\\b|\\b(\\d+(?:\\.\\d+)?)\\b",
+  "(--[^\\n]*)|('(?:[^']|'')*')|(&quot;(?:(?!&quot;).)*&quot;)|\\b(select|from|where|and|or|not|null|is|in|as|on|join|left|right|inner|outer|full|cross|lateral|group|order|by|having|limit|offset|union|all|distinct|case|when|then|else|end|create|table|view|materialized|index|unique|primary|key|foreign|references|constraint|default|check|insert|into|values|update|set|delete|returning|with|asc|desc|nulls|last|first|ilike|like|between|exists|function|returns|language|trigger|before|after|for|each|row|execute|begin|commit|rollback|explain|analyze|generated|always|identity|stored|partition|comment|alter|drop|grant|revoke|using|cascade|add|column|type|enum|policy|role|schema|database|rename|to|enable|disable|security|level|owner|restrict|nologin|usage|tables|count|sum|avg|min|max|date_trunc|coalesce)\\b|\\b(\\d+(?:\\.\\d+)?)\\b",
   "gi"
 );
 
@@ -182,3 +182,33 @@ export function tabs(defs, initial) {
   select(defs.find((d) => d.id === initial) ?? defs[0]);
   return h("div", bar, body);
 }
+
+/**
+ * A modal on the native <dialog>, which brings focus trapping, Esc and the backdrop with it.
+ * Resolves to the typed text (or true) when confirmed, and to null when dismissed.
+ * `requireText` keeps the confirm button disabled until that exact text has been typed.
+ */
+function openDialog({ title, body, confirmLabel = "Confirm", cancelLabel = "Cancel", danger = false, requireText, input }) {
+  return new Promise((resolve) => {
+    const field = (requireText || input) && h("input.input", { autocomplete: "off", autocapitalize: "none", spellcheck: false, placeholder: input?.placeholder ?? requireText, "aria-label": input?.label ?? `Type ${requireText} to confirm` });
+    const ok = h(`button.btn${danger ? ".danger" : ".primary"}`, { type: "submit", disabled: Boolean(requireText) || Boolean(input) }, confirmLabel);
+    const dialog = h("dialog.dialog", { "aria-label": title },
+      h("form", { method: "dialog", onsubmit: (e) => { e.preventDefault(); if (!ok.disabled) close(field ? field.value.trim() : true); } },
+        h("h2", title),
+        typeof body === "string" ? h("p", body) : body,
+        input?.label && h("label.dialog-label", input.label),
+        requireText && h("label.dialog-label", "Type ", h("strong.mono", requireText), " to confirm"),
+        field,
+        h("div.dialog-actions", h("button.btn", { type: "button", onclick: () => close(null) }, cancelLabel), ok)));
+    const close = (value) => { dialog.close(); dialog.remove(); resolve(value); };
+    field?.addEventListener("input", () => { ok.disabled = requireText ? field.value.trim() !== requireText : !field.value.trim(); });
+    dialog.addEventListener("cancel", (e) => { e.preventDefault(); close(null); });
+    dialog.addEventListener("click", (e) => { if (e.target === dialog) close(null); });
+    document.body.append(dialog);
+    dialog.showModal();
+    (field ?? ok).focus();
+  });
+}
+
+export const confirmDialog = (options) => openDialog(options).then((v) => v !== null);
+export const promptDialog = ({ label, placeholder, ...options }) => openDialog({ ...options, input: { label, placeholder } });
