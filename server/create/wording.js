@@ -37,7 +37,10 @@ export function describeOp(op) {
     case "drop_default": return `Remove the default of ${t}.${op.column}`;
     case "add_pk": return `Make (${op.columns.join(", ")}) the primary key of ${t}`;
     case "add_fk": return `Link ${t}.${op.columns.join(", ")} to ${tableName(op.refTable)}`;
-    case "add_unique": return `Make ${t} (${op.columns.join(", ")}) unique`;
+    case "set_fk_action": return op.onDelete === "cascade" ? `Delete ${t} rows together with the row they belong to (${op.name})`
+      : op.onDelete === "set_null" ? `Keep ${t} rows when the row they belong to is deleted, clearing the link (${op.name})`
+      : `Block deleting a row while ${t} rows still point at it (${op.name})`;
+    case "add_unique": return op.columns.length > 1 ? `Allow each combination of ${op.columns.join(" + ")} only once in ${t}` : `Make ${t} (${op.columns.join(", ")}) unique`;
     case "add_check": return `Require ${t}.${op.column} to be ${String(op.template).replace(/_/g, " ")}`;
     case "drop_constraint": return `Drop constraint ${op.name} from ${t}`;
     case "add_index": return `${op.unique ? "Unique index" : "Index"} on ${t} (${op.columns.join(", ")})`;

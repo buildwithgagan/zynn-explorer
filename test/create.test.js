@@ -136,6 +136,31 @@ test("undo: replaying the inverse ops returns the design to where it started", (
   assert.equal(fingerprint(back.draft), fingerprint(base));
 });
 
+test("a link's delete rule can be changed, and changed back", () => {
+  const base = build(SHOP).draft;
+  const name = "orders_customer_id_fkey";
+  const r = build([{ kind: "set_fk_action", table: "public.orders", name, onDelete: "restrict" }], base);
+  assert.deepEqual(r.broken, []);
+  assert.equal(r.statements[0].sql, `ALTER TABLE "public"."orders"\n  DROP CONSTRAINT "${name}",\n  ADD CONSTRAINT "${name}" FOREIGN KEY ("customer_id") REFERENCES "public"."customers" ("id") ON DELETE RESTRICT;`);
+  assert.equal(fingerprint(build(r.inverse, r.draft).draft), fingerprint(base));
+  assert.match(build([{ kind: "set_fk_action", table: "public.orders", name, onDelete: "cascade" }], base).broken[0].reason, /already deletes/);
+  // Clearing a link needs a column that may be empty.
+  assert.match(build([{ kind: "set_fk_action", table: "public.orders", name, onDelete: "set_null" }], base).broken[0].reason, /Make it optional first/);
+  const cleared = build([{ kind: "drop_not_null", table: "public.orders", column: "customer_id" }, { kind: "set_fk_action", table: "public.orders", name, onDelete: "set_null" }], base);
+  assert.deepEqual(cleared.broken, []);
+  assert.match(cleared.statements.at(-1).sql, /ON DELETE SET NULL;$/);
+  assert.equal(cleanOp({ kind: "set_fk_action", table: "t", name: "x", onDelete: "CASCADE; drop table y" }).onDelete, "restrict");
+});
+
+test("a combination of columns can be unique, and a default can be set", () => {
+  const base = build(SHOP).draft;
+  const r = build([{ kind: "add_unique", table: "public.orders", columns: ["customer_id", "total"] }, { kind: "set_default", table: "public.orders", column: "total", default: { kind: "number", value: 0 } }], base);
+  assert.deepEqual(r.broken, []);
+  assert.equal(r.statements[0].sql, 'ALTER TABLE "public"."orders" ADD CONSTRAINT "orders_customer_id_total_key" UNIQUE ("customer_id", "total");');
+  assert.equal(r.statements[1].sql, 'ALTER TABLE "public"."orders" ALTER COLUMN "total" SET DEFAULT 0;');
+  assert.equal(describeOp(cleanOp({ kind: "add_unique", table: "public.orders", columns: ["customer_id", "total"] })), "Allow each combination of customer_id + total only once in orders");
+});
+
 test("an enum value added in a draft cannot be used until it is applied", () => {
   const base = build([{ kind: "create_enum", name: "mood", values: ["ok"] }, table("t", [{ name: "m", type: { enum: "public.mood" } }])]).draft;
   const r = build([{ kind: "add_enum_value", enum: "public.mood", value: "great" }, { kind: "set_default", table: "public.t", column: "m", default: { kind: "enum_label", value: "great" } }], base);

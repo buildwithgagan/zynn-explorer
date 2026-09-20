@@ -4,7 +4,7 @@ import { ARCHETYPES, archetypeByName, columnFromArchetype } from "./archetypes.j
 import { BLUEPRINTS, blueprintById, entitiesOf, instantiate } from "./blueprints/index.js";
 import { newId } from "./ops.js";
 import { safeName } from "./validate.js";
-import { typeLabel } from "./types.js";
+import { typeLabel, defaultLabel } from "./types.js";
 import { stagedReply, noBlueprintReply, describeOp, DECLINES } from "./wording.js";
 
 // Natural language → ops, with Jev. Jev returns judgments, never text, so the shape is always:
@@ -29,10 +29,12 @@ const OPS = {
   new_database: "Create a new, empty database on the server. Examples: 'create a database called shop', 'new db named testing'.",
   create_table: "Create one or more specific new tables, usually naming their fields. Examples: 'create a table called invoices with number and amount', 'add a suppliers table', 'create a roles table with name and description', 'a permissions table'.",
   add_columns: "Add one or more new columns or fields to a table that already exists. Examples: 'add a phone number to customers', 'patients also need date of birth and allergies'.",
-  change_column: "Change how an existing column behaves: the type of data it holds, whether it is required or optional, or whether its values must be unique. Examples: 'make email required', 'phone should be optional', 'change price to a decimal', 'change quantity to a big whole number', 'turn notes into json', 'emails must be unique', 'billing email does not need to be unique'.",
+  change_column: "Change how an existing column behaves: the type of data it holds, whether it is required or optional, whether its values must be unique, or what value it gets by default. Examples: 'failed login count should default to 0', 'status defaults to active', 'make email required', 'phone should be optional', 'change price to a decimal', 'change quantity to a big whole number', 'turn notes into json', 'emails must be unique', 'billing email does not need to be unique'.",
   rename_thing: "Give an existing table or column a different name. Examples: 'rename clients to customers', 'call the fullname column name instead'.",
   remove_thing: "Delete an existing table or column. Examples: 'drop the legacy table', 'remove the fax column from contacts', 'get rid of notes'.",
-  relate_tables: "Connect two tables that exist: one belongs to the other, or they are many-to-many. Examples: 'orders belong to customers', 'each post has one author', 'posts can have many tags'.",
+  relate_tables: "Create a new link between two tables that exist but are not linked yet: one belongs to the other, or they are many-to-many. Examples: 'orders belong to customers', 'each post has one author', 'posts can have many tags'.",
+  unique_together: "Several columns of one table must be unique in combination: a row may repeat each value, but not the same combination. Examples: 'one membership per user per organization', 'provider and provider user id together must be unique', 'plan names must be unique within a product', 'a user can review a product only once'.",
+  on_delete: "Change what happens to linked rows when the row they belong to is deleted: delete them too, keep them and clear the link, or block the deletion. Examples: 'when a user is deleted keep their audit events', 'deleting a customer should delete their orders too', 'do not allow deleting a plan that has subscriptions'.",
   add_index: "Add an index to make lookups faster. Examples: 'index orders by created_at', 'add an index on email'.",
   seed_data: "Fill tables with sample, fake or test rows. Examples: 'add 50 fake rows', 'fill it with sample data', 'seed the customers table'.",
   access: "Database-level access: Postgres roles and privileges for the people or services that connect to the database, or row-level security. Examples: 'create a read-only role called analyst', 'let the reporting role read orders', 'revoke delete from the app role', 'users should only see their own rows'. Not this: tables that store an application's own users, roles or permissions.",
@@ -275,6 +277,8 @@ function foldIntoStaged(ops, baseline, op) {
   const touched = (o) => o.table === op.table || o.refTable === op.table;
   switch (op.kind) {
     case "set_not_null": if (!column) return null; column.nullable = false; return `${create.name}.${column.name} is now required in the draft.`;
+    case "set_default": if (!column || column.ref) return null; column.default = op.default; return `${create.name}.${column.name} now defaults to ${defaultLabel(op.default)} in the draft.`;
+    case "drop_default": if (!column?.default) return null; delete column.default; return `${create.name}.${column.name} no longer has a default in the draft.`;
     case "drop_not_null": if (!column) return null; column.nullable = true; return `${create.name}.${column.name} is now optional in the draft.`;
     case "add_unique": { const c = op.columns.length === 1 && create.columns.find((x) => x.name === op.columns[0]); if (!c) return null; c.unique = true; return `${create.name}.${c.name} is now unique in the draft.`; }
     case "alter_column_type": if (!column || column.ref) return null; Object.assign(column, { type: op.type, check: undefined, default: undefined, archetype: undefined }); return `${create.name}.${column.name} is now ${typeLabel(op.type)} in the draft.`;
@@ -590,6 +594,43 @@ export async function interpret(request, baseline, draft, current) {
 
   if (op.value === "access") return (await import("./access.js")).interpretAccess({ reading, request, state, draft, tables, schema: defaultSchema(draft), spans: { roles: of("role_name"), tables: tableSpans }, targetTable, mentioned, ops, done, decline });
 
+  if (op.value === "on_delete") {
+    // Every link between the tables the request touches is a candidate; code lists them, Jev picks one.
+    const involved = new Set([...mentioned.map((m) => m.id), ...tableSpans.map((s) => existingByIdent(s.ident)?.id), targetTable?.id].filter(Boolean));
+    const links = tables.flatMap((child) => child.table.fks.map((fk) => ({ child, fk, parent: tables.find((p) => p.id === fk.refTable) })))
+      .filter((l) => l.parent && (involved.has(l.child.id) || involved.has(l.parent.id))).slice(0, 40);
+    if (!links.length) return decline("I couldn't find a link between the tables you mention. Name both tables, for example: \"when a user is deleted, delete their sessions too\".");
+    const second = await reading.ask({ request }, {
+      link: choice("`request` says what should happen to some rows when the row they belong to is deleted. Which link is it about?", {
+        ...Object.fromEntries(links.map((l, i) => [`l${i}`, `Rows of "${l.child.label}" belong to a row of "${l.parent.label}" (through ${l.fk.columns.join(", ")}). The request is about what happens to the ${l.child.label} when their ${l.parent.label} row is deleted.`])),
+        [NONE]: "None of these.",
+      }),
+      action: choice("According to `request`, what should happen to the linked rows when the row they belong to is deleted?", {
+        cascade: "They are deleted too.",
+        set_null: "They are kept, and only their link to the deleted row is cleared or emptied.",
+        restrict: "The deletion is not allowed while such rows exist.",
+      }),
+    });
+    const link = reading.choice("link", "Link", second.link, { labels: { ...Object.fromEntries(links.map((l, i) => [`l${i}`, `${l.child.label} → ${l.parent.label}`])), [NONE]: "none" } });
+    const action = reading.choice("action", "On delete", second.action, { labels: { cascade: "delete them too", set_null: "keep, clear the link", restrict: "block the deletion" } });
+    if (!link.ok || link.value === NONE) return decline("I couldn't tell which link you mean. Say it with both tables, for example: \"when a user is deleted, keep their audit events\".");
+    if (!action.ok) return decline("I found the link but not what should happen. Say: delete them too, keep them, or block the deletion.");
+    const { child, fk } = links[Number(link.value.slice(1))];
+    if (fk.onDelete === action.value) return decline(`That is already how it works: ${describeOp({ kind: "set_fk_action", table: child.id, name: fk.name, onDelete: action.value }).replace(/ \(.*\)$/, "").replace(/^./, (c) => c.toLowerCase())}.`);
+    const required = action.value === "set_null" ? fk.columns.filter((c) => !child.table.columns.find((x) => x.name === c)?.nullable) : [];
+    // A table still in the draft carries its links inside its own CREATE TABLE.
+    const holder = !Object.hasOwn(baseline.tables, child.id) && ops.flatMap((o) => (o.kind === "create_table" && `${o.schema}.${o.name}` === child.id ? o.columns : o.kind === "add_column" && o.table === child.id ? [o.column] : []))
+      .find((c) => c.ref && c.name === fk.columns[0]);
+    if (holder) {
+      holder.ref.onDelete = action.value;
+      if (required.length) holder.nullable = true;
+      return done({ reply: { text: `In the draft, ${child.label}.${holder.name} now ${action.value === "cascade" ? "is deleted with" : action.value === "set_null" ? "is cleared when" : "blocks deleting"} its ${links[Number(link.value.slice(1))].parent.label} row${action.value === "set_null" ? " is deleted" : ""}.`, notes: required.length ? [`${holder.name} had to become optional, since a cleared link is an empty value.`] : [] }, added: [] });
+    }
+    const made = [...required.map((column) => ({ id: newId(), kind: "drop_not_null", table: child.id, column })), { id: newId(), kind: "set_fk_action", table: child.id, name: fk.name, onDelete: action.value }];
+    ops.push(...made);
+    return done({ reply: { text: stagedReply(made), notes: required.length ? [`${required.join(", ")} has to become optional first, since a cleared link is an empty value.`] : [] }, added: made.map((o) => o.id) });
+  }
+
   // The remaining kinds all change one existing table.
   if (!targetTable) return decline(DECLINES.no_target);
   const t = targetTable;
@@ -624,6 +665,27 @@ export async function interpret(request, baseline, draft, current) {
     return done({ reply: { text: staged ? `Added ${built.columns.map((c) => c.name).join(", ")} to the ${t.label} table in the draft.` : stagedReply(added), notes }, added: added.map((o) => o.id) });
   }
 
+  if (op.value === "unique_together") {
+    const describe = (c) => { const fk = t.table.fks.find((f) => f.columns.includes(c.name)); return fk ? `which ${tables.find((p) => p.id === fk.refTable)?.label ?? "row"} it belongs to` : typeLabel(c.type); };
+    const candidates = t.table.columns.filter((c) => !c.identity && !["created_at", "updated_at"].includes(c.name)).slice(0, 40);
+    // Columns named outright are taken as said ("provider and provider user id together"): the longest phrase wins, so
+    // "provider user id" does not also count as "user id". Jev is asked only when the wording is indirect ("per user").
+    const named = dropOverlaps(spans.filter((s) => candidates.some((c) => c.name === s.ident))).map((s) => s.ident);
+    if (named.length >= 2) {
+      named.forEach((c) => reading.rule(`ucol:${c}`, `Combination includes ${c}`, "named in the request"));
+      const made = [{ id: newId(), kind: "add_unique", table: t.id, columns: candidates.map((c) => c.name).filter((c) => named.includes(c)) }];
+      ops.push(...made);
+      return done({ reply: { text: stagedReply(made) }, added: [made[0].id] });
+    }
+    const second = await reading.ask({ request }, Object.fromEntries(candidates.map((c) => [`ucol:${c.name}`,
+      noul(`\`request\` says that some columns of the table "${t.label}" must be unique in combination. Is the column "${c.name}" (${describe(c)}) one of the columns in that combination?`)])));
+    const columns = candidates.filter((c) => reading.noul(`ucol:${c.name}`, `Combination includes ${c.name}`, second[`ucol:${c.name}`]).ok).map((c) => c.name);
+    if (columns.length < 2) return decline(`I need at least two columns of ${t.label} for a combination${columns.length ? `, and only found ${columns[0]}` : ""}. It has: ${t.table.columns.map((c) => c.name).join(", ")}. For a single column, say "${columns[0] ?? "email"} must be unique".`);
+    const made = [{ id: newId(), kind: "add_unique", table: t.id, columns }];
+    ops.push(...made);
+    return done({ reply: { text: stagedReply(made) }, added: [made[0].id] });
+  }
+
   const q = { col: choice(`Which column of the table "${t.label}" does \`request\` refer to?`, { ...columnOptions, [NONE]: "None of these columns, or the request is about the whole table." }) };
   if (op.value === "change_column") {
     q.change = choice("What change does `request` ask for?", {
@@ -632,9 +694,25 @@ export async function interpret(request, baseline, draft, current) {
       make_unique: "No two rows may share a value in this column.",
       allow_duplicates: "The column does not need to be unique: several rows may share the same value.",
       change_type: "The column should hold a different type of data.",
+      set_default: "The column should get a default value: the value used when none is given.",
       remove_default: "The column should no longer have a default value.",
     });
     q.newtype = choice("If `request` asks to change what type of data a column holds, which type does it ask for?", { ...Object.fromEntries(Object.entries(SIMPLE_TYPES).map(([k, [, d]]) => [k, d])), [NONE]: "It does not ask for a type." });
+  }
+  // Candidate default values are found in code: numbers, true/false, now/today, quoted text, and the labels of this table's enums.
+  const defaults = {};
+  if (op.value === "change_column") {
+    numberCandidates(request).forEach((n) => { defaults[`n:${n.value}`] = [{ kind: "number", value: n.value }, `The number ${n.phrase}`]; });
+    if (/\b(zero|none)\b/i.test(request) && !defaults["n:0"]) defaults["n:0"] = [{ kind: "number", value: 0 }, "The number zero"];
+    defaults.true = [{ kind: "bool", value: true }, "True, yes, on, enabled"];
+    defaults.false = [{ kind: "bool", value: false }, "False, no, off, disabled"];
+    defaults.now = [{ kind: "now" }, "The current date and time, now, the moment the row is created"];
+    defaults.today = [{ kind: "current_date" }, "Today's date"];
+    defaults.uuid = [{ kind: "uuid" }, "A newly generated random UUID"];
+    defaults.empty_json = [{ kind: "empty_json" }, "An empty JSON object"];
+    for (const c of t.table.columns) for (const v of draft.enums[c.type.enum]?.values ?? []) if (new RegExp(`\\b${v.replace(/_/g, "[ _-]")}\\b`, "i").test(request)) defaults[`e:${v}`] = [{ kind: "enum_label", value: v }, `The value "${v.replace(/_/g, " ")}"`];
+    for (const m of request.matchAll(/"([^"]{1,80})"|'([^']{1,80})'/g)) defaults[`s:${m[1] ?? m[2]}`] = [{ kind: "string", value: m[1] ?? m[2] }, `The text "${m[1] ?? m[2]}"`];
+    q.defval = choice("If `request` asks for a column to get a default value, which value is it?", { ...Object.fromEntries(Object.entries(defaults).map(([k, [, d]]) => [k, d])), [NONE]: "It does not ask for a default, or the value is none of these." });
   }
   if (op.value === "rename_thing" || op.value === "remove_thing") {
     q.what = choice(`Does \`request\` want to ${op.value === "rename_thing" ? "rename" : "delete"} the whole table "${t.label}", or one of its columns?`, { table: "The whole table.", column: "One column of the table." });
@@ -685,12 +763,24 @@ export async function interpret(request, baseline, draft, current) {
   }
   // change_column
   if (!col.ok || col.value === NONE) return decline(noColumn);
-  const change = reading.choice("change", "Change", second.change, { labels: { make_required: "required", make_optional: "optional", make_unique: "unique", allow_duplicates: "not unique", change_type: "new type", remove_default: "no default" } });
+  const change = reading.choice("change", "Change", second.change, { labels: { make_required: "required", make_optional: "optional", make_unique: "unique", allow_duplicates: "not unique", change_type: "new type", set_default: "default", remove_default: "no default" } });
   if (!change.ok) return decline("I found the column but not what to change about it. Say, for example: \"make it required\", \"make it optional\", \"must be unique\" or \"change it to a date\".");
   const base = { id: newId(), table: t.id, column: col.value };
   if (change.value === "make_required") return stage([{ ...base, kind: "set_not_null" }]);
   if (change.value === "make_optional") return stage([{ ...base, kind: "drop_not_null" }]);
   if (change.value === "remove_default") return stage([{ ...base, kind: "drop_default" }]);
+  if (change.value === "set_default") {
+    const pick = reading.choice("defval", "Default value", second.defval, { labels: { ...Object.fromEntries(Object.keys(defaults).map((k) => [k, k.replace(/^[nes]:/, "")])), [NONE]: "not found" } });
+    if (!pick.ok || pick.value === NONE) return decline("I couldn't find the default value in your message. I can set a number, true or false, now, today, a new UUID, an empty JSON object, one of the column's allowed values, or text in quotes.");
+    const value = defaults[pick.value][0];
+    const column = t.table.columns.find((c) => c.name === col.value);
+    // Whether a value suits a column's type is checkable, so it is checked here rather than asked.
+    const base0 = column.type.base;
+    const fits = { number: ["smallint", "integer", "bigint", "numeric", "real", "double precision"], bool: ["boolean"], now: ["timestamptz", "timestamp"], current_date: ["date"], uuid: ["uuid"], empty_json: ["jsonb", "json"], string: ["text", "varchar"] }[value.kind];
+    const ok = value.kind === "enum_label" ? draft.enums[column.type.enum]?.values.includes(value.value) : fits.includes(base0);
+    if (!ok) return decline(`${defaultLabel(value)} is not a value that ${t.label}.${column.name} (${typeLabel(column.type)}) can hold.`);
+    return stage([{ ...base, kind: "set_default", default: value }]);
+  }
   if (change.value === "allow_duplicates") {
     const staged = !Object.hasOwn(baseline.tables, t.id) && ops.find((o) => o.kind === "create_table" && `${o.schema}.${o.name}` === t.id);
     const column = staged ? staged.columns.find((c) => c.name === col.value) : null;

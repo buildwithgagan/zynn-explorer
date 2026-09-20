@@ -252,6 +252,14 @@ context ("is *limit value* the column to add to plan_features?").
 permissions" build tables. "Create a read-only role called analyst" and "let the api role edit users"
 create Postgres roles and grants ("the api role" names the role `api`).
 
+**Rules between columns and tables.** "One membership per user per organization" or "plan names must be unique
+within a product" adds a unique rule over the combination; columns named outright are taken as said, and Jev is
+asked only when the wording is indirect ("per user"). "Failed login count should default to 0" sets a default:
+code finds the candidate values and checks the chosen one suits the column's type. "When a user is deleted,
+keep their audit events" changes what a link does on delete (delete too / keep and clear / block); Create lists
+the links between the tables mentioned, Jev picks the link and the outcome, and a link that is to be cleared is
+made optional first.
+
 Changes to a table that is still only in the draft are folded into its CREATE TABLE (required, optional,
 unique, not unique, type, rename, remove), and removing a draft table also removes the enum types staged for it.
 
@@ -261,12 +269,11 @@ Jev selects; it cannot invent. A name must appear in your message or in a bluepr
 things people buy" gets a question back, not a guess. One kind of change per message. Domains outside the
 ten blueprints start as plain named tables for you to fill in. Sample data is plausible, not realistic,
 and triggers or hand-written checks on existing tables can reject it (the trial run says which). Not
-covered: views, functions, triggers, partitioning, composite foreign keys, unique rules across several
-columns ("one membership per user per organization"), column defaults, changing ON DELETE after the fact,
-converting existing data to an enum. For those, **Open in SQL editor**. Identity columns need Postgres 10+, `gen_random_uuid()` 13+.
+covered: views, functions, triggers, partitioning, composite foreign keys, converting existing data to an enum, defaults other than a number, true/false, now, today, a UUID, an empty
+JSON object, an allowed value or quoted text. For those, **Open in SQL editor**. Identity columns need Postgres 10+, `gen_random_uuid()` 13+.
 
 To re-check Jev's readings after changing a question or threshold, connect the app to a scratch database
-with the online-store blueprint applied and run `node scripts/creator-regression.mjs` (32 requests × 3,
+with the online-store blueprint applied and run `node scripts/creator-regression.mjs` (38 requests × 3,
 reports flips). `node scripts/creator-ask.mjs "…"` prints how one request was read. `node scripts/creator-blueprints-live.mjs` dry-runs every blueprint plus sample data.
 
 ## Layout

@@ -38,6 +38,13 @@ const CASES = [
   ["create a table called roles with name, description and is system", /^create_table:roles$/],
   ["the email on customers does not need to be unique", /^drop_constraint:customers$/],
   ["create a table called tickets with number and subject. ticket numbers must be unique", /^create_table:tickets\[number,subject\]$/],
+  // Combined uniqueness, defaults, and what happens on delete.
+  ["a customer can review a product only once", /^add_unique:reviews\((product_id,customer_id|customer_id,product_id)\)$/],
+  ["sku and name together must be unique on products", /^add_unique:products\(name,sku\)$/],
+  ["is active on products should default to false", /^set_default:products\.is_active=false$/],
+  ["the status of orders should default to paid", /^set_default:orders\.status=paid$/],
+  ["do not allow deleting a category that still has products", /^set_fk_action:products>restrict$/],
+  ["when a product is deleted, keep its order items but clear the product", /^drop_not_null:order_items\.product_id set_fk_action:order_items>set_null$/],
   ["review my schema", null],
   ["how many orders were placed last month", null],
   ["asdf qwerty lorem", null],
@@ -55,6 +62,9 @@ const sig = (o) => {
     case "rename_table": return `rename_table:${t(o.table)}>${o.name}`;
     case "add_index": return `add_index:${t(o.table)}(${o.columns})`;
     case "seed": return `seed:${o.rows}`;
+    case "add_unique": return `add_unique:${t(o.table)}(${o.columns})`;
+    case "set_default": return `set_default:${t(o.table)}.${o.column}=${o.default.value ?? o.default.kind}`;
+    case "set_fk_action": return `set_fk_action:${t(o.table)}>${o.onDelete}`;
     case "grant": return `grant:${o.role}[${o.privileges}]`;
     case "create_enum": case "create_role": return `${o.kind}:${o.name}`;
     default: return `${o.kind}:${t(o.table)}${o.column ? "." + o.column : ""}`;
