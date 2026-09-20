@@ -185,15 +185,56 @@ test("a calculated column is a template over real columns, never an expression",
   assert.equal(describeOp(cleanOp(gen("line_total", "multiply", ["quantity", "unit_price"]))), "Add line_total to order_items, always quantity × unit_price");
 });
 
+test("calculations can use a fixed number, and conditions give yes/no or one of two values", () => {
+  const base = build([{ kind: "create_enum", name: "order_status", values: ["pending", "paid"] },
+    table("orders2", [{ name: "total", type: T("numeric", 12, 2), nullable: false }, { name: "quantity", type: T("integer") }, { name: "limit_qty", type: T("integer") }, { name: "phone", type: T("text") }, { name: "paid", type: T("boolean") }, { name: "status", type: { enum: "public.order_status" } }])]).draft;
+  const gen = (name, rest) => ({ kind: "add_generated_column", table: "public.orders2", name, ...rest });
+  const sqlOf = (rest) => { const r = build([gen("x", rest)], base); assert.deepEqual(r.broken, []); return r.statements[0].sql.replace(/^.*ADD COLUMN "x" /, ""); };
+  assert.equal(sqlOf({ template: "multiply", columns: ["total"], constant: 1.2 }), 'numeric GENERATED ALWAYS AS ("total" * 1.2) STORED;');
+  assert.equal(sqlOf({ template: "multiply", columns: ["quantity"], constant: 12 }), 'bigint GENERATED ALWAYS AS ("quantity" * 12) STORED;');
+  assert.equal(sqlOf({ template: "subtract", columns: ["total"], constant: -5 }), 'numeric GENERATED ALWAYS AS ("total" - (-5)) STORED;');
+  assert.equal(sqlOf({ template: "subtract", columns: ["quantity"], constant: 100, constantFirst: true }), 'bigint GENERATED ALWAYS AS (100 - "quantity") STORED;');
+  assert.equal(sqlOf({ template: "divide", columns: ["quantity"], constant: 12 }), 'numeric GENERATED ALWAYS AS (("quantity")::numeric / 12) STORED;');
+  assert.equal(sqlOf({ template: "divide", columns: ["total", "quantity"] }), 'numeric GENERATED ALWAYS AS (("total")::numeric / NULLIF("quantity", 0)) STORED;');
+  assert.equal(sqlOf({ template: "when", condition: { column: "quantity", test: "gt", value: 100 } }), 'boolean GENERATED ALWAYS AS ("quantity" > 100) STORED;');
+  assert.equal(sqlOf({ template: "when", condition: { column: "total", test: "gt", value: 50 }, then: 0, else: 5 }), 'numeric GENERATED ALWAYS AS (CASE WHEN "total" > 50 THEN 0 ELSE 5 END) STORED;');
+  assert.equal(sqlOf({ template: "when", condition: { column: "quantity", test: "gte", value: { column: "limit_qty" } }, then: { text: "o'er" }, else: { text: "ok" } }), `text GENERATED ALWAYS AS (CASE WHEN "quantity" >= "limit_qty" THEN 'o''er' ELSE 'ok' END) STORED;`);
+  assert.equal(sqlOf({ template: "when", condition: { column: "status", test: "eq", value: { label: "paid" } } }), `boolean GENERATED ALWAYS AS ("status" = 'paid'::"public"."order_status") STORED;`);
+  assert.equal(sqlOf({ template: "when", condition: { column: "phone", test: "is_set" } }), 'boolean GENERATED ALWAYS AS ("phone" IS NOT NULL) STORED;');
+  assert.equal(sqlOf({ template: "when", condition: { column: "paid", test: "eq", value: { bool: true } }, then: 1 }), 'numeric GENERATED ALWAYS AS (CASE WHEN "paid" = true THEN 1 END) STORED;');
+
+  const why = (rest) => build([gen("x", rest)], base).broken[0]?.reason;
+  assert.match(why({ template: "divide", columns: ["total"], constant: 0 }), /Dividing by zero/);
+  assert.match(why({ template: "concat", columns: ["phone"], constant: 2 }), /Only times, plus, minus and divided by/);
+  assert.match(why({ template: "multiply", columns: ["phone"], constant: 2 }), /not a number/);
+  assert.match(why({ template: "when", condition: { column: "phone", test: "gt", value: 3 } }), /needs a number or a date/);
+  assert.match(why({ template: "when", condition: { column: "status", test: "eq", value: { label: "refunded" } } }), /not one of the values/);
+  assert.match(why({ template: "when", condition: { column: "total", test: "gt", value: 1 }, then: 1, else: { text: "a" } }), /both text/);
+  assert.match(why({ template: "when", condition: { column: "total", test: "gt" } }), /something to compare with/);
+  // Nothing but a number or short text can be a constant; a test is a name from a list; a smuggled column is just a missing column.
+  assert.throws(() => cleanOp(gen("x", { template: "multiply", columns: ["total"], constant: "1); drop table y; --" })), /ordinary number/);
+  assert.throws(() => cleanOp(gen("x", { template: "multiply", columns: ["total"], constant: 1e400 })), /ordinary number/);
+  assert.equal(cleanOp(gen("x", { template: "when", condition: { column: "total", test: "> 1 OR true --", value: 1 } })).condition.test, undefined);
+  assert.match(why({ template: "when", condition: { column: 'total" > 0 OR true --', test: "gt", value: 1 } }), /has no column/);
+  // The inputs of a conditional column are protected like any other.
+  const made = build([gen("is_big", { template: "when", condition: { column: "quantity", test: "gt", value: { column: "limit_qty" } } })], base).draft;
+  assert.match(build([{ kind: "drop_column", table: "public.orders2", column: "limit_qty" }], made).broken[0].reason, /is_big is calculated from limit_qty/);
+  assert.equal(describeOp(cleanOp(gen("fee", { template: "when", condition: { column: "total", test: "gt", value: 50 }, then: 0, else: 5 }))), "Add fee to orders2: 0 when total is more than 50, otherwise 5");
+  assert.equal(describeOp(cleanOp(gen("gross", { template: "multiply", columns: ["total"], constant: 1.2 }))), "Add gross to orders2, always total × 1.2");
+  assert.equal(describeOp(gen("gross", { template: "divide", columns: ["total"], constant: 12 })), "Add gross to orders2, always total ÷ 12"); // before cleaning, as the chat reply sees it
+});
+
 test("calculated columns read from the catalog are matched back to their template", () => {
   const cols = ["quantity", "unit_price", "first_name", "last_name", "email", "expires_at", "created_at"];
-  assert.deepEqual(parseCatalogGenerated("((quantity)::numeric * unit_price)", cols), null); // a cast Create did not write: left opaque
+  // A shape that is not a plain template stays opaque, but the columns it reads are still known. Text inside quotes is not a column.
+  assert.deepEqual(parseCatalogGenerated("((quantity)::numeric * unit_price)", cols), { template: null, columns: ["quantity", "unit_price"] });
+  assert.deepEqual(parseCatalogGenerated("CASE WHEN (quantity > 100) THEN 'email'::text ELSE 'small'::text END", cols), { template: null, columns: ["quantity"] });
   assert.deepEqual(parseCatalogGenerated("(quantity * unit_price)", cols), { template: "multiply", columns: ["quantity", "unit_price"] });
   assert.deepEqual(parseCatalogGenerated("(expires_at - created_at)", cols), { template: "subtract", columns: ["expires_at", "created_at"] });
   assert.deepEqual(parseCatalogGenerated("((first_name || ' '::text) || last_name)", cols), { template: "concat", columns: ["first_name", "last_name"] });
   assert.deepEqual(parseCatalogGenerated("lower(email)", cols), { template: "lower", columns: ["email"] });
-  assert.equal(parseCatalogGenerated("(quantity * missing)", cols), null);
-  assert.equal(parseCatalogGenerated("(quantity * unit_price) + 1", cols), null);
+  assert.deepEqual(parseCatalogGenerated("(quantity * missing)", cols), { template: null, columns: ["quantity"] });
+  assert.equal(parseCatalogGenerated("(1 + 1)", cols), null);
 });
 
 test("a default can be a time from now", () => {

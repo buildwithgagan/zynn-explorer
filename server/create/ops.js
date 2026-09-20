@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { cleanType, cleanDefault, CHECKS, ON_DELETE, PRIVILEGES, POLICY_COMMANDS, POLICY_TEMPLATES, GENERATED } from "./types.js";
+import { cleanType, cleanDefault, CHECKS, ON_DELETE, PRIVILEGES, POLICY_COMMANDS, POLICY_TEMPLATES, GENERATED, TESTS, cleanConstant } from "./types.js";
 
 // An op is one staged change. Ops arrive from the browser, so every one is rebuilt here field by field:
 // what is not listed for its kind is dropped, and what is listed is coerced to a known shape.
@@ -39,7 +39,19 @@ const SHAPES = {
   set_comment: (r) => ({ table: str(r.table), column: str(r.column), comment: str(r.comment, 300) ?? "" }),
   add_column: (r) => ({ table: str(r.table), column: cleanColumn(r.column), index: bool(r.index, true) }),
   // A column Postgres calculates from others in the same row. The calculation is a template name, never an expression.
-  add_generated_column: (r) => ({ table: str(r.table), name: str(r.name, 80), template: oneOf(r.template, Object.keys(GENERATED), undefined), columns: strList(r.columns, 2) }),
+  // `constant` stands in for the second value ("price times 1.2"). `template: "when"` is a test on a column that gives
+  // yes/no, or one of two constants ("0 when total is over 50, otherwise 5").
+  add_generated_column: (r) => ({
+    table: str(r.table), name: str(r.name, 80), template: oneOf(r.template, [...Object.keys(GENERATED), "when"], undefined), columns: strList(r.columns, 2),
+    constant: cleanConstant(r.constant), constantFirst: r.constantFirst ? true : undefined,
+    condition: r.condition && typeof r.condition === "object" ? {
+      column: str(r.condition.column), test: oneOf(r.condition.test, Object.keys(TESTS), undefined),
+      value: r.condition.value == null ? undefined : typeof r.condition.value === "object" && r.condition.value.column != null ? { column: str(r.condition.value.column) }
+        : typeof r.condition.value === "object" && r.condition.value.label != null ? { label: str(r.condition.value.label, 63) }
+        : typeof r.condition.value === "object" && r.condition.value.bool != null ? { bool: Boolean(r.condition.value.bool) } : cleanConstant(r.condition.value),
+    } : undefined,
+    then: cleanConstant(r.then), else: cleanConstant(r.else),
+  }),
   drop_column: (r) => ({ table: str(r.table), column: str(r.column) }),
   rename_column: (r) => ({ table: str(r.table), column: str(r.column), name: str(r.name, 80) }),
   alter_column_type: (r) => ({ table: str(r.table), column: str(r.column), type: cleanType(r.type) }),

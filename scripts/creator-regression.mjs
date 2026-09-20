@@ -51,6 +51,16 @@ const CASES = [
   ["add a lowercase version of email called email lower to customers", /^add_generated_column:customers\.email_lower=lower\(email\)$/],
   ["add a margin to order items that is unit price minus quantity", /^add_generated_column:order_items\.margin=subtract\(unit_price,quantity\)$/],
   ["add a gap to order items: subtract quantity from unit price", /^add_generated_column:order_items\.gap=subtract\(unit_price,quantity\)$/],
+  // Constants and conditions.
+  ["add a gross price to products that is price times 1.2", /^add_generated_column:products\.gross_price=multiply\(price\)\*1\.2$/],
+  ["add a vat to products that is 20 percent of price", /^add_generated_column:products\.vat=multiply\(price\)\*0\.2$/],
+  ["add a dozens to order items that is quantity divided by 12", /^add_generated_column:order_items\.dozens=divide\(quantity\)\*12$/],
+  ["add a remaining to order items that is 100 minus quantity", /^add_generated_column:order_items\.remaining=subtract\(quantity\)\*100 first$/],
+  ["add an is bulk flag to order items that is true when quantity is over 100", /^add_generated_column:order_items\.is_bulk=when\(quantity gt 100\)$/],
+  ["add a shipping fee to orders: 0 when total is over 50, otherwise 5", /^add_generated_column:orders\.shipping_fee=when\(total gt 50\)\?0:5$/],
+  ["add a has phone flag to customers that is true when phone is filled in", /^add_generated_column:customers\.has_phone=when\(phone is_set\)$/],
+  ["add an is paid flag to orders that is true when status is paid", /^add_generated_column:orders\.is_paid=when\(status eq paid\)$/],
+  ["add an is overdue flag to orders that is true when placed at is before today", null],
   ["placed at on orders should default to 2 days from now", /^set_default:orders\.placed_at=now_plus$/],
   // Changing and removing a combination rule. The third item stages a rule first; the whole draft is compared.
   ["reviews should be unique per product, customer and rating instead", /^add_unique:reviews\(product_id,customer_id,rating\)$/, [{ id: "rule", kind: "add_unique", table: "public.reviews", columns: ["product_id", "customer_id"] }]],
@@ -72,7 +82,11 @@ const sig = (o) => {
     case "rename_table": return `rename_table:${t(o.table)}>${o.name}`;
     case "add_index": return `add_index:${t(o.table)}(${o.columns})`;
     case "seed": return `seed:${o.rows}`;
-    case "add_generated_column": return `add_generated_column:${t(o.table)}.${o.name}=${o.template}(${o.columns})`;
+    case "add_generated_column": {
+      const v = (c) => c?.column ?? c?.label ?? c?.text ?? (c?.bool != null ? String(c.bool) : c?.number);
+      if (o.template === "when") return `add_generated_column:${t(o.table)}.${o.name}=when(${o.condition.column} ${o.condition.test}${o.condition.value ? " " + v(o.condition.value) : ""})${o.then ? `?${v(o.then)}:${v(o.else) ?? ""}` : ""}`;
+      return `add_generated_column:${t(o.table)}.${o.name}=${o.template}(${o.columns})${o.constant ? `*${v(o.constant)}${o.constantFirst ? " first" : ""}` : ""}`;
+    }
     case "add_unique": return `add_unique:${t(o.table)}(${o.columns})`;
     case "set_default": return `set_default:${t(o.table)}.${o.column}=${o.default.value ?? o.default.kind}`;
     case "set_fk_action": return `set_fk_action:${t(o.table)}>${o.onDelete}`;

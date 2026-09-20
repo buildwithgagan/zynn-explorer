@@ -264,10 +264,21 @@ made optional first.
 `GENERATED ALWAYS AS (…) STORED` column (a Postgres default cannot read other columns, so this is what "computed from
 other columns" means). The calculation is one of five templates (multiply, add, subtract or the time between two
 moments, join two texts, lowercase); Jev picks the template and the new name, code checks the input types fit and
-derives the result type. Input columns named outright are taken in spoken order, "a minus b" and "subtract b from a"
+derives the result type, and no free SQL expression enters an op. Input columns named outright are taken in spoken order, "a minus b" and "subtract b from a"
 fix the order by rule, and only "the time between a and b" is left to Jev. A column that feeds a calculation cannot be
 dropped or retyped from under it, including calculated columns Create finds already in the database. Defaults can also
 be relative: "expires at should default to 30 days from now".
+
+A calculation may use a **fixed number** in place of the second column ("price times 1.2", "yearly price divided by 12",
+"100 minus quantity", "20 percent of price", which becomes × 0.2) and may be a **condition**: a test on a column (more
+than, at least, less than, at most, is, is not, has a value, is empty) against a number, one of the column's allowed
+values, yes/no, quoted text or another column. A condition gives yes/no ("is locked when failed login count is at
+least 5"), or one of two constants ("\"premium\" when monthly price is over 50, otherwise \"standard\""). Code finds the
+candidate constants in the request and Jev assigns them their roles; when there is only one number, or the sentence
+order settles it, no question is asked. Division casts to numeric first (7 / 2 is 3.5, not Postgres's whole-number 3)
+and a zero divisor gives an empty value rather than an error that would block the row. A calculated column must give the
+same answer every time, so a condition on today or now ("is overdue", "is expired") is refused with that explanation
+and pointed at Ask instead of being frozen into the table.
 
 **Changing a combination rule.** On a table that already has one, "memberships should be unique per organization,
 user and role instead" replaces it (drop and add in the same transaction), and "… no longer needs to be unique, remove
@@ -285,12 +296,12 @@ Jev selects; it cannot invent. A name must appear in your message or in a bluepr
 things people buy" gets a question back, not a guess. One kind of change per message. Domains outside the
 ten blueprints start as plain named tables for you to fill in. Sample data is plausible, not realistic,
 and triggers or hand-written checks on existing tables can reject it (the trial run says which). Not
-covered: views, functions, triggers, partitioning, composite foreign keys, converting existing data to an enum, calculations outside the five templates (constants, more than two
-columns, conditions), and defaults other than a number, true/false, now, today, a time from now, a UUID, an empty
+covered: views, functions, triggers, partitioning, composite foreign keys, converting existing data to an enum, calculations with more than two columns, several conditions at once, or anything that depends on the
+current time, and defaults other than a number, true/false, now, today, a time from now, a UUID, an empty
 JSON object, an allowed value or quoted text. For those, **Open in SQL editor**. Identity columns need Postgres 10+, `gen_random_uuid()` 13+.
 
 To re-check Jev's readings after changing a question or threshold, connect the app to a scratch database
-with the online-store blueprint applied and run `node scripts/creator-regression.mjs` (46 requests × 3,
+with the online-store blueprint applied and run `node scripts/creator-regression.mjs` (55 requests × 3,
 reports flips). `node scripts/creator-ask.mjs "…"` prints how one request was read. `node scripts/creator-blueprints-live.mjs` dry-runs every blueprint plus sample data.
 
 ## Layout
