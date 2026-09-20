@@ -481,3 +481,12 @@ label.check.small { font-size: var(--text-xs); gap: 5px; }
   .creator-side { padding: 8px 12px 0; } .creator-body { overflow: visible; }
   .apply-bar { position: sticky; bottom: 0; }
 }
+
+.change-list { margin: 0; padding: 0; list-style: none; counter-reset: change; display: grid; gap: 6px; }
+.change-list li { counter-increment: change; display: grid; gap: 2px; padding: 8px 11px 8px 34px; position: relative; background: var(--surface3); border: 1px solid var(--border1); border-left: 2px solid var(--accent1); border-radius: var(--radius-lg); min-width: 0; }
+.change-list li::before { content: counter(change); position: absolute; left: 11px; top: 8px; font: var(--text-xs)/1.7 var(--font-mono); color: var(--neutral2); }
+.change-list li.failed { border-left-color: var(--accent2); }
+.change-said { font: var(--text-xs)/1.5 var(--font-mono); color: var(--neutral3); overflow-wrap: anywhere; }
+.change-result { font-size: var(--text-smd); color: var(--neutral5); line-height: 1.5; }
+.change-note { font-size: var(--text-sm); color: var(--accent6); line-height: 1.5; }
+html.light .change-note { color: var(--badge-yellow-fg); }

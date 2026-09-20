@@ -278,6 +278,20 @@ function addColumns(ops, baseline, tableId, columns) {
  * the table is live (or the change is not one that folds) and the op should be staged as it is.
  */
 function foldIntoStaged(ops, baseline, op) {
+  // A column that is itself still only staged ("add a nickname to customers and make it required") is changed where it is staged.
+  const adding = op.table && ops.find((o) => o.kind === "add_column" && o.table === op.table && o.column.name === (op.column ?? op.columns?.[0]) && !o.column.ref);
+  if (adding) {
+    const c = adding.column, where = `${op.table.split(".").pop()}.${c.name}`;
+    switch (op.kind) {
+      case "set_not_null": c.nullable = false; return `${where} will be added as required.`;
+      case "drop_not_null": c.nullable = true; return `${where} will be added as optional.`;
+      case "add_unique": if (op.columns.length !== 1) return null; c.unique = true; return `${where} will be added as unique.`;
+      case "alter_column_type": Object.assign(c, { type: op.type, check: undefined, default: undefined, archetype: undefined }); return `${where} will be added as ${typeLabel(op.type)}.`;
+      case "set_default": c.default = op.default; return `${where} will be added with the default ${defaultLabel(op.default)}.`;
+      case "drop_column": ops.splice(ops.indexOf(adding), 1); return `Took ${where} back out of the draft.`;
+      default: break;
+    }
+  }
   if (!op.table || Object.hasOwn(baseline.tables, op.table)) return null;
   const create = ops.find((o) => o.kind === "create_table" && `${o.schema}.${o.name}` === op.table);
   if (!create) return null;
@@ -368,14 +382,19 @@ const ON_DELETE_OPTIONS = {
  * @param current   the current (clean) ops
  * → { ok, reply, ops (the new full list), added (op ids), suggestions, judgments, pendingDatabase?, focus?, usage, model }
  */
-export async function interpret(request, baseline, draft, current) {
+/**
+ * `focus` is what the previous request in the same message was about: { table, column }. It lets "… and make it required"
+ * stand on its own. What this request was about comes back as `subject`, for the next one. (`focus` in a reply is a tab.)
+ */
+export async function interpret(request, baseline, draft, current, focus = {}) {
+  const about = { table: focus.table, column: undefined };
   const reading = new Reading();
   const ops = structuredClone(current);
   const tables = labelTables(draft);
   const byLabel = new Map(tables.map((t) => [t.label, t]));
   const spans = identCandidates(request).map((s, order) => ({ ...s, order }));
   const state = { request, tables: Object.fromEntries(tables.map((t) => [t.label, describeTable(t.table)])) };
-  const done = (extra) => ({ ok: true, ops, added: [], suggestions: [], judgments: reading.judgments, usage: reading.usage, model: reading.model, ...extra });
+  const done = (extra) => ({ ok: true, ops, added: [], suggestions: [], judgments: reading.judgments, usage: reading.usage, model: reading.model, subject: about, ...extra });
   const decline = (text, extra) => done({ ok: false, reply: { text }, ops: current, ...extra });
 
   const [aboutTables, aboutWording] = await Promise.all([reading.ask(state, tableQuestions(tables)), reading.ask({ request }, wordingQuestions(spans))]);
@@ -429,7 +448,13 @@ export async function interpret(request, baseline, draft, current) {
     reading.judgments.push({ key: `span:${s.order}`, title: `"${s.text}" is`, value: s.role.value.replace(/_/g, " "), p: s.role.p, applied: true, alternatives: [] });
   }
   const target = reading.choice("target", "Table", first.target, { labels: { [NEW]: "a new table", [NONE]: "no single table" }, applied: !["design_domain", "new_database", "create_table"].includes(op.value) });
-  const targetTable = target.ok && byLabel.get(target.value);
+  let targetTable = target.ok && byLabel.get(target.value);
+  // "… and make it required": no table is named, so the request continues with the table the previous one was about.
+  if (!targetTable && focus.table && !tableSpans.some((s) => existingByIdent(s.ident))) {
+    targetTable = tables.find((x) => x.id === focus.table) ?? null;
+    if (targetTable) reading.rule("target:carried", "Table", `${targetTable.label} (carried over)`);
+  }
+  if (targetTable) about.table = targetTable.id;
   const mentioned = tables.filter((t) => (first[`uses:${t.label}`]?.noul ?? 0) >= STATED);
 
   // -- a new database ------------------------------------------------------
@@ -572,6 +597,7 @@ export async function interpret(request, baseline, draft, current) {
     const notes = [];
     if (!fieldSpans.length) notes.push("You didn't name any fields, so I started with a name column. Tell me what else it should store.");
     if (weak.length) notes.push(`I wasn't sure what kind of value ${weak.join(", ")} hold${weak.length === 1 ? "s" : ""}, so ${weak.length === 1 ? "it is" : "they are"} plain text for now. Change the type in the Changes tab if that's wrong.`);
+    about.table = `${schema}.${names.at(-1)}`;
     const unused = unusedNote(names[0]);
     if (unused) notes.push(unused);
     return done({
@@ -702,6 +728,7 @@ export async function interpret(request, baseline, draft, current) {
     const added = [...built.enums, ...addColumns(ops, baseline, t.id, built.columns)];
     const notes = [];
     if (relaxed.length) notes.push(`${relaxed.join(", ")} would normally be required, but ${t.label} may already hold rows that have no value for ${relaxed.length === 1 ? "it" : "them"}. I left ${relaxed.length === 1 ? "it" : "them"} optional: fill the existing rows, then ask me to make ${relaxed.length === 1 ? "it" : "them"} required.`);
+    if (built.columns.length === 1) about.column = built.columns[0].name;
     const unusedHere = unusedNote(t.label, fields);
     if (unusedHere) notes.push(unusedHere);
     if (built.weak.length) notes.push(`I wasn't sure what kind of value ${built.weak.join(", ")} hold${built.weak.length === 1 ? "s" : ""}, so ${built.weak.length === 1 ? "it is" : "they are"} plain text for now.`);
@@ -908,6 +935,10 @@ export async function interpret(request, baseline, draft, current) {
       set_default: "The column should get a default value: the value used when none is given.",
       remove_default: "The column should no longer have a default value.",
     });
+    // "unique and required" is two changes to one column. The main one is chosen above; these catch what rides along.
+    q.also_required = noul("Does `request` say the column must always have a value (required, mandatory, not null)?");
+    q.also_optional = noul("Does `request` say the column may be left empty (optional, nullable)?");
+    q.also_unique = noul("Does `request` say that no two rows may share a value in this column (unique)?");
     q.newtype = choice("If `request` asks to change what type of data a column holds, which type does it ask for?", { ...Object.fromEntries(Object.entries(SIMPLE_TYPES).map(([k, [, d]]) => [k, d])), [NONE]: "It does not ask for a type." });
   }
   // Candidate default values are found in code: numbers, true/false, now/today, quoted text, and the labels of this table's enums.
@@ -944,7 +975,7 @@ export async function interpret(request, baseline, draft, current) {
   const second = await reading.ask({ request }, q);
   const destructive = op.value === "remove_thing";
   const bar = destructive ? INFERRED : STATED;
-  const stage = (made, sure = true) => {
+  let stage = (made, sure = true) => {
     if (made.length === 1) {
       const folded = foldIntoStaged(ops, baseline, made[0]);
       if (folded) return done({ reply: { text: folded }, added: [] });
@@ -961,7 +992,13 @@ export async function interpret(request, baseline, draft, current) {
   }
 
   const what = q.what ? reading.choice("what", "Applies to", second.what, { bar }) : { value: "column", ok: true, p: 1 };
-  const col = reading.choice("col", "Column", second.col, { labels: { [NONE]: "no column" }, applied: what.value !== "table", bar });
+  let col = reading.choice("col", "Column", second.col, { labels: { [NONE]: "no column" }, applied: what.value !== "table", bar });
+  // "make it required" after "add a phone number to customers": the column is the one just spoken about.
+  if ((!col.ok || col.value === NONE) && focus.column && t.id === focus.table && t.table.columns.some((c) => c.name === focus.column) && /\b(it|its|that|this|them|those)\b/i.test(request) && !destructive) {
+    col = { ok: true, value: focus.column, p: 1 };
+    reading.rule("col:carried", "Column", `${focus.column} (carried over)`);
+  }
+  if (col.ok && col.value !== NONE) about.column = col.value;
   const sure = op.p >= bar && target.p >= bar;
 
   if (op.value === "remove_thing") {
@@ -982,6 +1019,25 @@ export async function interpret(request, baseline, draft, current) {
   const change = reading.choice("change", "Change", second.change, { labels: { make_required: "required", make_optional: "optional", make_unique: "unique", allow_duplicates: "not unique", change_type: "new type", set_default: "default", remove_default: "no default" } });
   if (!change.ok) return decline("I found the column but not what to change about it. Say, for example: \"make it required\", \"make it optional\", \"must be unique\" or \"change it to a date\".");
   const base = { id: newId(), table: t.id, column: col.value };
+  const column0 = t.table.columns.find((c) => c.name === col.value);
+  const alreadyUnique = t.table.uniques.some((u) => u.columns.length === 1 && u.columns[0] === col.value);
+  // Changes that ride along with the main one, when they would actually change something.
+  const extras = [];
+  if (change.value !== "make_required" && change.value !== "make_optional" && column0?.nullable && reading.noul("also_required", "Also required", second.also_required).ok) extras.push({ id: newId(), kind: "set_not_null", table: t.id, column: col.value });
+  if (change.value !== "make_required" && change.value !== "make_optional" && !column0?.nullable && reading.noul("also_optional", "Also optional", second.also_optional).ok) extras.push({ id: newId(), kind: "drop_not_null", table: t.id, column: col.value });
+  if (!["make_unique", "allow_duplicates"].includes(change.value) && !alreadyUnique && reading.noul("also_unique", "Also unique", second.also_unique).ok) extras.push({ id: newId(), kind: "add_unique", table: t.id, columns: [col.value] });
+  if (extras.length) {
+    const main = stage;
+    // Stage the extras after the main change, each through the same path, so draft tables still fold them in.
+    stage = (made, sure = true) => {
+      const first = main(made, sure);
+      if (!first.ok) return first;
+      const texts = [first.reply.text];
+      for (const extra of extras) { const r = main([extra]); if (r.ok) { texts.push(r.reply.text); first.added.push(...r.added); } }
+      const folded = texts.every((x) => / in the draft\.$/.test(x));
+      return { ...first, reply: { ...first.reply, text: folded ? texts.join(" ") : stagedReply(ops.filter((o) => first.added.includes(o.id))) } };
+    };
+  }
   if (change.value === "make_required") return stage([{ ...base, kind: "set_not_null" }]);
   if (change.value === "make_optional") return stage([{ ...base, kind: "drop_not_null" }]);
   if (change.value === "remove_default") return stage([{ ...base, kind: "drop_default" }]);
