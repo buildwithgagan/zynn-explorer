@@ -1,6 +1,6 @@
 import { withTransaction, connectionInfo } from "../db.js";
 import { invalidateModel } from "../nl/model.js";
-import { loadDesign, fingerprint } from "./design.js";
+import { loadDesign, invalidateDesign, fingerprint } from "./design.js";
 import { compileOps } from "./compile.js";
 import * as seed from "./seed.js";
 import * as history from "./history.js";
@@ -13,6 +13,8 @@ const fail = (status, message, extra) => Object.assign(new Error(message), { sta
  * the live design, so the SQL that runs is the SQL this server compiled, never text from the request.
  */
 export async function apply(ops, { confirm, fingerprint: expected, dryRun = false } = {}) {
+  // Never from the cache: the point of the fingerprint is to notice a change made somewhere else since the preview.
+  invalidateDesign();
   const baseline = await loadDesign();
   if (expected && expected !== fingerprint(baseline)) throw fail(409, "The database changed since this draft was previewed. Review the refreshed draft, then apply again.");
   const compiled = compileOps(baseline, ops);

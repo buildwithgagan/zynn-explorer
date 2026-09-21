@@ -615,7 +615,13 @@ const STEPS = {
     needRole(d, op.name);
     delete d.roles[op.name];
     for (const t of Object.values(d.tables)) t.grants = t.grants.filter((g) => g.role !== op.name);
-    out.push({ sql: `DROP ROLE ${quoteIdent(op.name)};`, level: "caution", reason: "Fails while the role still owns objects or holds privileges" });
+    // Postgres will not drop a role that still holds a privilege, and a grant made here also gave it USAGE on the schema.
+    // Revoke what it holds in this database, schema by schema. (Not DROP OWNED: that would also delete anything it owns.)
+    for (const schema of d.schemas) {
+      out.push({ sql: `REVOKE ALL ON ALL TABLES IN SCHEMA ${quoteIdent(schema)} FROM ${quoteIdent(op.name)};`, level: "caution", reason: `${op.name} loses its access in ${schema}` });
+      out.push({ sql: `REVOKE ALL ON SCHEMA ${quoteIdent(schema)} FROM ${quoteIdent(op.name)};`, level: "caution" });
+    }
+    out.push({ sql: `DROP ROLE ${quoteIdent(op.name)};`, level: "caution", reason: "Fails if the role still owns objects, or holds privileges in another database" });
     return null;
   },
 

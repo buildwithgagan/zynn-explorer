@@ -76,6 +76,7 @@ const CASES = [
   ["add a nickname to customers and make it required", /^add_column:customers\.nickname!$/],
   ["the phone on customers must be unique and required", /^(set_not_null:customers\.phone add_unique:customers\(phone\)|add_unique:customers\(phone\) set_not_null:customers\.phone)$/],
   ["create a table called notes with body. each note belongs to a customer. index notes by created at", /^create_table:notes add_index:notes\(created_at\)$/],
+  ["create a table called notes with title and body, and create a table called labels with name. notes can have many labels and labels can have many notes", /^create_table:notes create_table:labels create_table:label_notes$/],
   ["rename categories to collections. what's the weather like", /^rename_table:categories>collections$/], // one part fails, the other still stages
   ["export the schema as sql", null],
   ["review my schema", null],
