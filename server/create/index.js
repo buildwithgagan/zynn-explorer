@@ -1,6 +1,6 @@
 import * as db from "../db.js";
 import { invalidateModel, loadModel } from "../nl/model.js";
-import { loadDesign, fingerprint, toErd } from "./design.js";
+import { loadDesign, invalidateDesign, fingerprint, toErd } from "./design.js";
 import { cleanOps, newId } from "./ops.js";
 import { compileOps, migrationSql } from "./compile.js";
 import { checkNewIdent, OpError } from "./validate.js";
@@ -139,6 +139,7 @@ export async function seed(body) {
 }
 
 export async function listHistory() {
+  invalidateDesign(); // whether undo is still possible depends on the schema as it is right now
   const live = fingerprint(await loadDesign());
   const entries = await history.list(history.databaseKey(db.connectionInfo()));
   return entries.map((e, i) => ({

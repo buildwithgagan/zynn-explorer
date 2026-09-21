@@ -346,8 +346,15 @@ covered: views over more than one table or with several tests, functions, trigge
 depends on the current time is refused by design: that is what a view is for), and defaults other than a number, true/false, now, today, a time from now, a UUID, an empty
 JSON object, an allowed value or quoted text. For those, **Open in SQL editor**. Identity columns need Postgres 10+, `gen_random_uuid()` 13+.
 
+Undo and failure are exercised against a real server by `node scripts/creator-undo-live.mjs` (19 checks on a scratch
+database it creates and drops): a 15-change migration is applied and undone and the `pg_dump` before and after must be
+identical with no rows lost; a migration that fails on its third statement must be caught by the trial run, fail on the
+same statement when forced, leave the schema untouched and log nothing; a migration that deleted data must not be
+offered for undo; and an undo previewed before someone changed the schema elsewhere must be refused. Apply and History
+always read the schema fresh rather than from the one-minute cache, for exactly that last case.
+
 To re-check Jev's readings after changing a question or threshold, connect the app to a scratch database
-with the online-store blueprint applied and run `node scripts/creator-regression.mjs` (66 requests × 3,
+with the online-store blueprint applied and run `node scripts/creator-regression.mjs` (67 requests × 3,
 reports flips). `node scripts/creator-ask.mjs "…"` prints how one request was read. `node scripts/creator-blueprints-live.mjs` dry-runs every blueprint plus sample data.
 
 ## Layout

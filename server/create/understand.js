@@ -410,6 +410,11 @@ export async function interpret(request, baseline, draft, current, focus = {}) {
     op = { value: "unique_together", p: top1.p + top2.p, ok: true };
     reading.rule("op:scope", "Scope words", "a combination, not one column");
   }
+  // "Create a table … it can have many …" splits Jev between creating and linking. Both readings are about tables and
+  // relations, so either is accepted here, and a fact decides further down: does every table named exist?
+  if (top2 && [top1.value, top2.value].every((v) => ["relate_tables", "create_table"].includes(v)) && top1.value !== top2.value && top1.p + top2.p >= INFERRED) {
+    op = { value: "relate_tables", p: top1.p + top2.p, ok: true };
+  }
   if (!op.ok) {
     const [a, b] = ranked(first.op);
     return decline("I wasn't sure what kind of change that is. Try saying it more directly, for example:", {
@@ -523,6 +528,13 @@ export async function interpret(request, baseline, draft, current, focus = {}) {
       reply: { text: stagedReply(fresh, { blueprint }), notes }, added: fresh.map((o) => o.id),
       suggestions: left.map((o) => ({ label: `Also add ${o.entities.map((e) => e.table).join(" and ")}`, say: `also add ${o.entities.map((e) => e.table).join(" and ")} to the ${blueprint.title.toLowerCase()} design` })),
     });
+  }
+
+  // "create a table called tags with name. notes can have many tags …" talks about a relation, but one end does not
+  // exist yet. Whether a named table exists is a fact, so code settles it: this creates a table (and links it).
+  if (op.value === "relate_tables" && tableSpans.some((s) => !existingByIdent(s.ident)) && /\b(create|add|new|build|make)\b[^.]*\btables?\b/i.test(request)) {
+    op = { ...op, value: "create_table" };
+    reading.rule("op:new-table", "Kind of change", "create table (one of the tables named does not exist yet)");
   }
 
   // -- new tables ----------------------------------------------------------

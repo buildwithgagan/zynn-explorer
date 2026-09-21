@@ -272,6 +272,9 @@ test("access: grants include schema usage, policies switch row-level security on
   assert.match(sql, /GRANT USAGE ON SCHEMA "public" TO "app";\nGRANT SELECT, INSERT ON "public"\."orders" TO "app";/);
   assert.match(sql, /ENABLE ROW LEVEL SECURITY;\nCREATE POLICY "orders_owner_column_policy" ON "public"\."orders"\n {2}FOR ALL TO "app"\n {2}USING \("owner" = current_user\)\n {2}WITH CHECK \("owner" = current_user\);/);
   assert.match(build([{ kind: "grant", role: "ghost", privileges: ["SELECT"], allIn: "public" }]).broken[0].reason, /Role ghost does not exist/);
+  // Found by the live undo run: DROP ROLE fails while the role holds any privilege, and a grant also gives USAGE on the schema.
+  const dropped = build([{ kind: "drop_role", name: "app" }], r.draft).statements.map((x) => x.sql);
+  assert.deepEqual(dropped, ['REVOKE ALL ON ALL TABLES IN SCHEMA "public" FROM "app";', 'REVOKE ALL ON SCHEMA "public" FROM "app";', 'DROP ROLE "app";']);
 });
 
 test("every blueprint, with every option on, builds a clean draft", () => {
