@@ -490,3 +490,5 @@ label.check.small { font-size: var(--text-xs); gap: 5px; }
 .change-result { font-size: var(--text-smd); color: var(--neutral5); line-height: 1.5; }
 .change-note { font-size: var(--text-sm); color: var(--accent6); line-height: 1.5; }
 html.light .change-note { color: var(--badge-yellow-fg); }
+.op-affects { margin: 0; font: var(--text-sm)/1.5 var(--font-mono); color: var(--neutral5); }
+.op-card.destructive .op-affects { color: var(--accent2); }

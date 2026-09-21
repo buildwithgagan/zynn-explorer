@@ -154,6 +154,36 @@ function conditionSql(d, t, k, { clock = false, input = (name) => getColumn(t, n
   return { sql: test.sql(quoteIdent(a.name), right), reads };
 }
 
+/** SQL for a value stored into `column`, checked against the column's type. */
+function valueSql(d, t, column, v) {
+  const c = getColumn(t, column);
+  if (c.identity || c.generated) throw new OpError(`${t.name}.${c.name} is filled in by Postgres and cannot be set`);
+  if (!v) throw new OpError(`A value for ${c.name} is needed`);
+  const kind = typeLabel(c.type);
+  if (v.null) { if (!c.nullable) throw new OpError(`${t.name}.${c.name} is required, so it cannot be emptied`); return "NULL"; }
+  if (v.clock != null) {
+    if (!["date", "timestamp", "timestamptz"].includes(c.type.base)) throw new OpError(`${c.name} is ${kind}, which cannot hold ${v.clock}`);
+    return c.type.base === "date" ? "CURRENT_DATE" : "now()";
+  }
+  if (v.label != null) {
+    const e = c.type.enum && d.enums[c.type.enum];
+    if (!e?.values.includes(v.label)) throw new OpError(`"${v.label}" is not one of the values ${c.name} can hold${e ? ` (${e.values.join(", ")})` : ""}`);
+    return `${quoteLiteral(v.label)}::${qualified(e.schema, e.name)}`;
+  }
+  if (v.bool != null) { if (c.type.base !== "boolean") throw new OpError(`${c.name} is ${kind}, not yes/no`); return v.bool ? "true" : "false"; }
+  if (v.number != null) { if (!isNumericBase(c.type.base)) throw new OpError(`${c.name} is ${kind}, which cannot hold a number`); return numberSql(v.number); }
+  if (v.text != null) {
+    // Text may also be written into an enum column when it is one of its values.
+    const e = c.type.enum && d.enums[c.type.enum];
+    if (e) { const label = e.values.find((x) => x === v.text || x === v.text.toLowerCase().replace(/[^a-z0-9]+/g, "_")); if (!label) throw new OpError(`"${v.text}" is not one of the values ${c.name} can hold (${e.values.join(", ")})`); return `${quoteLiteral(label)}::${qualified(e.schema, e.name)}`; }
+    if (!isTextBase(c.type.base)) throw new OpError(`${c.name} is ${kind}, which cannot hold text`);
+    return quoteLiteral(v.text);
+  }
+  throw new OpError(`A value for ${c.name} is needed`);
+}
+
+const rowsWord = (t) => `rows of ${t.name}`;
+
 /** The expression, result type and input columns of a calculated column. Built from templates, quoted names and literals only. */
 function generatedExpression(d, t, op) {
   const input = (name) => {
@@ -710,6 +740,58 @@ const STEPS = {
     if (!t.policies.some((p) => p.name === op.name)) throw new OpError(`${t.name} has no policy "${String(op.name).slice(0, 60)}"`);
     t.policies = t.policies.filter((p) => p.name !== op.name);
     out.push({ sql: `DROP POLICY ${quoteIdent(op.name)} ON ${tableSql(t)};`, level: "caution", reason: "Rows this policy allowed are no longer visible" });
+    return null;
+  },
+
+  // ---- rows. `count` is a read-only query the server runs for the preview, so the draft can say how many rows are affected.
+  delete_rows(d, op, out) {
+    const t = getTable(d, op.table);
+    if (!op.filter) throw new OpError(`Deleting every row is "empty the ${t.name} table". A delete needs a test that picks the rows`);
+    const where = conditionSql(d, t, op.filter, { clock: true }).sql;
+    out.push({ sql: `DELETE FROM ${tableSql(t)} WHERE ${where};`, count: `SELECT count(*) FROM ${tableSql(t)} WHERE ${where}`, level: "destructive", reason: `Deletes the matching ${rowsWord(t)}. Rows in other tables that must point at them will block it` });
+    return null;
+  },
+
+  truncate_tables(d, op, out) {
+    if (!op.tables.length) throw new OpError("Name the table to empty");
+    const wanted = new Set(op.tables.map((id) => { getTable(d, id); return id; }));
+    // Postgres will not empty a table that others point at unless they are emptied with it. Work out which those are, and name them.
+    const all = new Set(wanted);
+    for (let grew = true; grew;) {
+      grew = false;
+      for (const [id, o] of Object.entries(d.tables)) if (!all.has(id) && o.fks.some((f) => all.has(f.refTable))) { all.add(id); grew = true; }
+    }
+    const extra = [...all].filter((id) => !wanted.has(id));
+    if (extra.length && !op.withDependents) throw new OpError(`${extra.map((id) => d.tables[id].name).join(", ")} point${extra.length === 1 ? "s" : ""} at ${[...wanted].map((id) => d.tables[id].name).join(", ")}, so ${extra.length === 1 ? "it has" : "they have"} to be emptied too. Say "and everything that points at it" to include ${extra.length === 1 ? "it" : "them"}`);
+    const list = [...all].map((id) => d.tables[id]);
+    out.push({
+      sql: `TRUNCATE TABLE ${list.map(tableSql).join(", ")}${op.restartIdentity ? " RESTART IDENTITY" : ""};`,
+      count: `SELECT ${list.map((t) => `(SELECT count(*) FROM ${tableSql(t)})`).join(" + ")}`,
+      level: "destructive", reason: `Deletes every row of ${list.map((t) => t.name).join(", ")}${extra.length ? ` (${extra.map((id) => d.tables[id].name).join(", ")} because ${extra.length === 1 ? "it points" : "they point"} at the rest)` : ""}. The tables themselves stay`,
+    });
+    return null;
+  },
+
+  update_rows(d, op, out) {
+    const t = getTable(d, op.table);
+    const value = valueSql(d, t, op.set.column, op.set.value);
+    const where = op.filter ? conditionSql(d, t, op.filter, { clock: true }).sql : null;
+    out.push({
+      sql: `UPDATE ${tableSql(t)} SET ${quoteIdent(op.set.column)} = ${value}${where ? ` WHERE ${where}` : ""};`,
+      count: `SELECT count(*) FROM ${tableSql(t)}${where ? ` WHERE ${where}` : ""}`,
+      level: "destructive", reason: `Overwrites ${op.set.column} in ${where ? "the matching" : "every one of the"} ${rowsWord(t)}. The old values are not kept`,
+    });
+    return null;
+  },
+
+  insert_row(d, op, out) {
+    const t = getTable(d, op.table);
+    if (!op.values.length) throw new OpError("A new row needs at least one value");
+    const given = new Set();
+    const pairs = op.values.map((x) => { if (given.has(x.column)) throw new OpError(`${x.column} is given twice`); given.add(x.column); return [quoteIdent(getColumn(t, x.column).name), valueSql(d, t, x.column, x.value)]; });
+    const missing = t.columns.filter((c) => !c.nullable && !c.default && !c.identity && !c.generated && !given.has(c.name)).map((c) => c.name);
+    if (missing.length) throw new OpError(`A row of ${t.name} also needs ${missing.join(", ")}`);
+    out.push({ sql: `INSERT INTO ${tableSql(t)} (${pairs.map((p) => p[0]).join(", ")}) VALUES (${pairs.map((p) => p[1]).join(", ")});`, level: "safe", reason: "Adds one row" });
     return null;
   },
 

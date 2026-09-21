@@ -1,5 +1,5 @@
 import { ask, choice, noul } from "../jev.js";
-import { identCandidates, numberCandidates, tableIdent, singularize, valueLists } from "../nl/candidates.js";
+import { identCandidates, numberCandidates, tableIdent, singularize, valueLists, mentionsNegation } from "../nl/candidates.js";
 import { ARCHETYPES, archetypeByName, columnFromArchetype } from "./archetypes.js";
 import { BLUEPRINTS, blueprintById, entitiesOf, instantiate } from "./blueprints/index.js";
 import { newId } from "./ops.js";
@@ -32,7 +32,7 @@ const OPS = {
   add_columns: "Add one or more new columns or fields to a table that already exists. Examples: 'add a phone number to customers', 'patients also need date of birth and allergies'.",
   change_column: "Change how an existing column behaves: the type of data it holds, whether it is required or optional, whether its values must be unique, or what value it gets by default. Examples: 'failed login count should default to 0', 'status defaults to active', 'expires at should default to 30 days from now', 'make email required', 'phone should be optional', 'change price to a decimal', 'change quantity to a big whole number', 'turn notes into json', 'emails must be unique', 'billing email does not need to be unique'.",
   rename_thing: "Give an existing table or column a different name. Examples: 'rename clients to customers', 'call the fullname column name instead'.",
-  remove_thing: "Delete an existing table or column. Examples: 'drop the legacy table', 'remove the fax column from contacts', 'get rid of notes'.",
+  remove_thing: "Delete an existing table or column itself (not just the rows in it). Examples: 'drop the legacy table', 'remove the fax column from contacts', 'get rid of notes'.",
   relate_tables: "Create a new link between two tables that exist but are not linked yet: one belongs to the other, or they are many-to-many. Examples: 'orders belong to customers', 'each post has one author', 'posts can have many tags'.",
   computed_column: "Add a column whose value is always calculated from other columns of the same row (optionally with a fixed number or a condition), so it never has to be filled in. Examples: 'add a line total to order items that is quantity times unit price', 'full name should be first name plus last name', 'add a duration that is ends at minus starts at', 'add a lowercase version of email called email lower', 'add a gross price that is price times 1.2', 'add an is large flag that is true when quantity is over 100', 'shipping fee is 0 when total is over 50, otherwise 5'.",
   create_view: "Create a view: a saved way of looking at one table, worked out fresh every time it is read. It shows the table's rows with an extra yes/no column from a test, or only the rows that pass a test. The test may compare with now or today. Examples: 'create a view of sessions with an is expired flag that is true when expires at is before now', 'create a view called active subscriptions showing subscriptions where status is active', 'a view of overdue invoices: invoices where due date is before today'.",
@@ -40,6 +40,7 @@ const OPS = {
   unique_together: "Several columns of one table must be unique in combination: a row may repeat each value, but not the same combination. Examples: 'one membership per user per organization', 'provider and provider user id together must be unique', 'plan names must be unique within a product', 'a user can review a product only once'. Also changing or removing such a rule: 'memberships should be unique per organization, user and role instead', 'plan names no longer need to be unique within a product'.",
   on_delete: "Change what happens to linked rows when the row they belong to is deleted: delete them too, keep them and clear the link, or block the deletion. Examples: 'when a user is deleted keep their audit events', 'deleting a customer should delete their orders too', 'do not allow deleting a plan that has subscriptions'.",
   add_index: "Add an index to make lookups faster. Examples: 'index orders by created_at', 'add an index on email'.",
+  change_rows: "Change the data itself, not the structure: delete some rows, empty a table of its rows, change a value in existing rows, or add one row. The table and its columns stay as they are. Examples: 'empty the sessions table', 'delete all the sample data', 'delete sessions where expires at is before now', 'set every trialing subscription to active', 'set seat limit to 10 on plans', 'add a product called Explorer with slug explorer'.",
   seed_data: "Fill tables with sample, fake or test rows. Examples: 'add 50 fake rows', 'fill it with sample data', 'seed the customers table'.",
   access: "Database-level access: Postgres roles and privileges for the people or services that connect to the database, or row-level security. Examples: 'create a read-only role called analyst', 'let the reporting role read orders', 'revoke delete from the app role', 'users should only see their own rows'. Not this: tables that store an application's own users, roles or permissions.",
   advise: "Review or critique the existing design and suggest improvements. Examples: 'review my schema', 'what should I improve', 'any problems with this design'.",
@@ -732,6 +733,18 @@ export async function interpret(request, baseline, draft, current, focus = {}) {
     return done({ reply: { text: stagedReply(made), notes: ["A view stores nothing, so no data is lost."] }, added: [made[0].id] });
   }
 
+  if (op.value === "change_rows" && !targetTable) {
+    if (!tables.length) return decline("There are no tables here yet, so there are no rows to change.");
+    const second = await reading.ask({ request }, {
+      every: noul("Does `request` ask to remove the rows of every table, all the data, or all the sample data, rather than of particular tables?"),
+    });
+    if (!reading.noul("every", "Every table", second.every).ok) return decline(DECLINES.no_target);
+    const made = [{ id: newId(), kind: "truncate_tables", tables: tables.filter((x) => Object.hasOwn(baseline.tables, x.id)).map((x) => x.id), withDependents: true, restartIdentity: true }];
+    if (!made[0].tables.length) return decline("Every table here is still only in the draft, so there are no rows yet.");
+    ops.push(...made);
+    return done({ reply: { text: stagedReply(made), notes: ["This deletes every row of every table and restarts their numbering. The tables, views and roles stay. Applying it will ask you to type the database name."] }, added: [made[0].id] });
+  }
+
   // The remaining kinds all change one existing table.
   if (!targetTable) return decline(DECLINES.no_target);
   const t = targetTable;
@@ -782,22 +795,44 @@ export async function interpret(request, baseline, draft, current, focus = {}) {
     ccol2: choice(`If the test in \`request\` compares the tested column with another column of "${t.label}", which column is it compared with?`, { ...columnChoices, [NONE]: "It is compared with a fixed value, or with nothing." }),
     cval: choice("If the test in `request` compares a column with a fixed value, which value is it compared with?", pickFrom(values)),
   });
-  const readCondition = (second, said, values, columnList, { clock = false } = {}) => {
-    let test = reading.choice("ctest", "Test", second.ctest, { labels: { gt: "more than", gte: "at least", lt: "less than", lte: "at most", eq: "is", neq: "is not", is_set: "has a value", is_empty: "is empty" } });
-    // Words that are a comparison with the clock in themselves.
+  // Which test a sentence describes is a matter of its wording, so code reads it. Longer phrases first: "no more than"
+  // is not "more than". Jev's answer is kept only as a confident tiebreak when the wording says nothing.
+  const TEST_WORDS = [
+    ["is_empty", /\b(is|are|was|were)\s+(empty|missing|blank|unset|unknown)\b|\b(has|have|with)\s+no\b|\bwithout\s+an?\b|\bnot\s+(set|filled in|given|known)\b/i],
+    ["is_set", /\b(filled in|has a value|have a value|is present|are present|is set|is known|is given|not empty|not blank)\b/i],
+    ["gte", /\b(at least|or more|or later|no less than|not less than|on or after|from\b.+\bupwards|minimum of)\b/i],
+    ["lte", /\b(at most|or less|or fewer|or earlier|no more than|not more than|on or before|up to|maximum of)\b/i],
+    ["gt", /\b(over|above|more than|greater than|bigger than|larger than|higher than|longer than|later than|after|exceeds?|exceeding)\b/i],
+    ["lt", /\b(under|below|less than|fewer than|smaller than|lower than|shorter than|earlier than|before)\b/i],
+  ];
+  const readCondition = (second, said, values, columnList, { clock = false, bar = STATED, onlyValue = null } = {}) => {
     const past = /\b(expired|overdue|in the past|has passed|have passed|lapsed|elapsed)\b/i.test(request), future = /\b(upcoming|in the future|not yet|still valid|still active)\b/i.test(request);
-    if (clock && (past || future) && (!test.ok || !["lt", "lte", "gt", "gte"].includes(test.value))) {
-      test = { ok: true, value: past ? "lt" : "gt" };
-      reading.rule("ctest:clock", "Test", past ? "before now (from the wording)" : "after now (from the wording)");
+    const negated = mentionsNegation(request.replace(/\b(no longer|not yet|no more than|no less than|not more than|not less than|not empty|not blank|not set|not filled in|not given|not known)\b/gi, " "));
+    const worded = TEST_WORDS.find(([, re]) => re.test(request))?.[0] ?? (clock && past ? "lt" : clock && future ? "gt" : null);
+    const asked = ranked(second.ctest)[0];
+    // No comparison word at all: "the cancelled orders" are those whose status IS cancelled, and "not" needs a "not".
+    let test = worded ?? (asked && asked.p >= INFERRED && !["eq", "neq"].includes(asked.value) ? asked.value : negated ? "neq" : "eq");
+    if (test === "eq" && negated) test = "neq";
+    reading.rule("ctest", "Test", `${{ gt: "more than", gte: "at least", lt: "less than", lte: "at most", eq: "is", neq: "is not", is_set: "has a value", is_empty: "is empty" }[test]}${worded ? " (from the wording)" : asked && test === asked.value ? "" : " (no comparison word, so a plain \"is\")"}`);
+    const unary = test === "is_set" || test === "is_empty";
+
+    // The value compared with, read before the column: an allowed value belongs to exactly one column, and says which.
+    const fixed = unary ? { ok: false } : reading.choice("cval", "Compared with", second.cval, { bar, labels: { ...Object.fromEntries(Object.keys(values).map((k) => [k, k.replace(/^[nes]:/, "")])), [NONE]: "not found" } });
+    // When only one candidate value is left it is the one, whatever share of the probability it got.
+    if (onlyValue && !unary) reading.rule("cval:only", "Compared with", `${onlyValue.label ?? onlyValue.text ?? onlyValue.number} (the only value left)`);
+    const fixedValue = onlyValue && !unary ? onlyValue : fixed.ok && fixed.value !== NONE ? values[fixed.value]?.[0] : null;
+    const owners = fixedValue?.label != null ? t.table.columns.filter((c) => draft.enums[c.type.enum]?.values.includes(fixedValue.label)) : [];
+    let tested;
+    if (said.length >= 1 && said.length <= 2) { tested = said[0].ident; reading.rule("ccol", "Tested column", tested); }
+    else if (owners.length === 1) { tested = owners[0].name; reading.rule("ccol", "Tested column", `${tested} (the column that holds "${fixedValue.label}")`); }
+    else {
+      const c = reading.choice("ccol", "Tested column", second.ccol, { labels: { [NONE]: "not found" }, bar });
+      if (!c.ok || c.value === NONE) return { error: `I couldn't tell which column the test is about. ${columnList}` };
+      tested = c.value;
     }
-    if (!test.ok) return { error: "I understood this is a condition, but not the test. Say, for example: \"is over 100\", \"is at least 5\", \"is paid\", \"is before now\", \"is filled in\" or \"is empty\"." };
-    const unary = test.value === "is_set" || test.value === "is_empty";
-    const tested = said.length >= 1 && said.length <= 2 ? { ok: true, value: said[0].ident, rule: true } : reading.choice("ccol", "Tested column", second.ccol, { labels: { [NONE]: "not found" } });
-    if (tested.rule) reading.rule("ccol", "Tested column", tested.value);
-    if (!tested.ok || tested.value === NONE) return { error: `I couldn't tell which column the test is about. ${columnList}` };
-    const condition = { column: tested.value, test: test.value };
+    const condition = { column: tested, test };
     if (unary) return { condition };
-    const column = t.table.columns.find((c) => c.name === tested.value);
+    const column = t.table.columns.find((c) => c.name === tested);
     const isMoment = ["date", "timestamp", "timestamptz"].includes(column?.type.base);
     // Against the clock: said outright ("before now", "after today"), or implied by a word like "expired".
     if (clock && isMoment && said.length < 2 && (/\b(now|today|current (time|date)|right now|this moment)\b/i.test(request) || past || future)) {
@@ -806,13 +841,129 @@ export async function interpret(request, baseline, draft, current, focus = {}) {
       return { condition };
     }
     if (said.length === 2) { condition.value = { column: said[1].ident }; reading.rule("ccol2", "Compared with", said[1].ident); return { condition }; }
-    const other = reading.choice("ccol2", "Compared with column", second.ccol2, { labels: { [NONE]: "a fixed value" }, applied: false });
-    const fixed = reading.choice("cval", "Compared with", second.cval, { labels: { ...Object.fromEntries(Object.keys(values).map((k) => [k, k.replace(/^[nes]:/, "")])), [NONE]: "not found" } });
-    if (fixed.ok && fixed.value !== NONE) condition.value = values[fixed.value][0];
-    else if (other.ok && other.value !== NONE && other.value !== tested.value) condition.value = { column: other.value };
-    else return { error: `I found the test but not what to compare with. I can compare with a number, one of the column's allowed values, yes or no, text in quotes, another column${clock ? ", or now and today" : ""}.` };
-    return { condition };
+    if (fixedValue) { condition.value = fixedValue; return { condition }; }
+    const other = reading.choice("ccol2", "Compared with column", second.ccol2, { labels: { [NONE]: "a fixed value" }, bar });
+    if (other.ok && other.value !== NONE && other.value !== tested) { condition.value = { column: other.value }; return { condition }; }
+    return { error: `I found the test but not what to compare with. I can compare with a number, one of the column's allowed values, yes or no, text in quotes, another column${clock ? ", or now and today" : ""}.` };
   };
+
+  if (op.value === "change_rows") {
+    if (!Object.hasOwn(baseline.tables, t.id)) return decline(`${t.label} is still only in the draft, so it has no rows yet. Apply the draft first.`);
+    const usable = t.table.columns.filter((c) => c.type.base || c.type.enum).slice(0, 60);
+    const columnChoices = Object.fromEntries(usable.map((c) => [c.name, typeLabel(c.type)]));
+    const columnList = `${t.label} has: ${usable.map((c) => c.name).join(", ")}.`;
+    const settable = usable.filter((c) => !c.identity && !c.generated);
+    // A value written as words, read by the column it goes into. Null when the words do not fit that column.
+    const valueFor = (column, words) => {
+      const raw = String(words).trim().replace(/^["'“]|["'”]$/g, "").trim();
+      if (!raw) return null;
+      if (/^(empty|nothing|null|blank|none|unset)$/i.test(raw)) return { null: true };
+      const e = draft.enums[column.type.enum];
+      if (e) { const label = e.values.find((v) => v === raw || v === raw.toLowerCase().replace(/[^a-z0-9]+/g, "_")); return label ? { label } : null; }
+      const base0 = column.type.base;
+      if (["smallint", "integer", "bigint", "numeric", "real", "double precision"].includes(base0)) { const n = Number(raw.replace(/[,$€£]/g, "")); return Number.isFinite(n) && /\d/.test(raw) ? { number: n } : null; }
+      if (base0 === "boolean") return /^(true|yes|on|enabled)$/i.test(raw) ? { bool: true } : /^(false|no|off|disabled)$/i.test(raw) ? { bool: false } : null;
+      if (["date", "timestamp", "timestamptz"].includes(base0)) return /^(now|today|the current (time|date))$/i.test(raw) ? { clock: base0 === "date" ? "today" : "now" } : null;
+      return ["text", "varchar"].includes(base0) ? { text: raw } : null;
+    };
+    const spoken = (c) => c.name.replace(/_/g, "[ _]");
+    const numbers = numberCandidates(request);
+    const quoted = [...request.matchAll(/"([^"]{1,80})"|'([^']{1,80})'|“([^”]{1,80})”/g)].map((m) => m[1] ?? m[2] ?? m[3]);
+    const labels = usable.flatMap((c) => (draft.enums[c.type.enum]?.values ?? []).filter((v) => new RegExp(`\\b${v.replace(/_/g, "[ _-]")}\\b`, "i").test(request)));
+    const values = {
+      ...Object.fromEntries(numbers.map((n) => [`n:${n.value}`, [{ number: n.value }, `The number ${n.phrase}`]])),
+      ...Object.fromEntries(labels.map((v) => [`e:${v}`, [{ label: v }, `The value "${v.replace(/_/g, " ")}"`]])),
+      ...Object.fromEntries(quoted.map((x) => [`s:${x}`, [{ text: x }, `The text "${x}"`]])),
+      true: [{ bool: true }, "True, yes"], false: [{ bool: false }, "False, no"],
+    };
+    const pickFrom = (set) => ({ ...Object.fromEntries(Object.entries(set).map(([k, [, d]]) => [k, d])), [NONE]: "None of these." });
+    const second = await reading.ask({ request }, {
+      rkind: choice(`\`request\` changes the rows of the table "${t.label}". How?`, {
+        delete_some: "Delete only the rows that pass a test. Examples: 'delete sessions where expires at is before now', 'remove the cancelled subscriptions'.",
+        empty: "Delete every row of the table, leaving it empty. Examples: 'empty the sessions table', 'clear out users', 'delete all rows'.",
+        update: "Change a value in rows that already exist. Examples: 'set every trialing subscription to active', 'set seat limit to 10', 'mark all products as inactive'.",
+        insert: "Add one new row. Examples: 'add a product called Explorer', 'insert a role named admin'.",
+      }),
+      dependents: noul("Does `request` say to also remove the rows of other tables that point at these, such as 'and everything that points at it', 'and everything related', 'with their sessions too'?"),
+      ucol: choice(`If \`request\` changes a value in existing rows of "${t.label}", which column gets the new value?`, { ...Object.fromEntries(settable.map((c) => [c.name, typeLabel(c.type)])), [NONE]: "None of these." }),
+      uval: choice("If `request` changes a value in existing rows, what is the NEW value they should have afterwards?", { ...pickFrom(values), now: "The current date and time", nothing: "Nothing: the value is cleared, emptied" }),
+      ...conditionQuestions(columnChoices, values, pickFrom),
+    });
+    const kind = reading.choice("rkind", "Row change", second.rkind, { labels: { delete_some: "delete some rows", empty: "empty the table", update: "change a value", insert: "add a row" }, bar: STATED });
+    if (!kind.ok) return decline("I couldn't tell whether to delete rows, empty the table, change a value, or add a row. Say it directly, for example: \"delete sessions where expires at is before now\".");
+    const said = dropOverlaps(spans.filter((sp) => usable.some((c) => c.name === sp.ident))).sort((x, y) => x.run - y.run || x.start - y.start);
+    const warn = "Applying it will ask you to type the database name. It cannot be undone.";
+
+    if (kind.value === "empty") {
+      const withDependents = reading.noul("dependents", "Including what points at it", second.dependents).ok;
+      const made = [{ id: newId(), kind: "truncate_tables", tables: [t.id], withDependents, restartIdentity: true }];
+      ops.push(...made);
+      return done({ reply: { text: stagedReply(made), notes: [`Every row of ${t.label} is deleted and its numbering restarts. The table itself stays. ${warn}`] }, added: [made[0].id] });
+    }
+
+    if (kind.value === "insert") {
+      // Values are read by rule: "called X" is the row's name, and "<column> <value>" gives that column its value.
+      const given = [];
+      const naming = settable.find((c) => ["name", "title", "label", "full_name", "subject"].includes(c.name));
+      const called = /\b(?:called|named|titled)\s+("[^"]+"|'[^']+'|“[^”]+”|[^,]+?)(?=\s+(?:with|and|,)|,|$)/i.exec(request);
+      if (called && naming) given.push({ column: naming, words: called[1] });
+      for (const c of [...settable].sort((a, b) => b.name.length - a.name.length)) {
+        if (given.some((g) => g.column === c)) continue;
+        const m = new RegExp(`\\b${spoken(c)}\\s+(?:is\\s+|of\\s+|=\\s*|:\\s*|as\\s+)?("[^"]+"|'[^']+'|“[^”]+”|[^,]+?)(?=\\s+and\\s+|,|$)`, "i").exec(request.replace(called?.[0] ?? "\u0000", " "));
+        if (m) given.push({ column: c, words: m[1] });
+      }
+      if (!given.length) return decline(`I couldn't find the values for the new row. Say them with their columns, for example: "add a row to ${t.label} with ${settable.slice(0, 2).map((c) => `${c.name.replace(/_/g, " ")} …`).join(" and ")}". ${columnList}`);
+      const bad = given.filter((g) => !valueFor(g.column, g.words));
+      if (bad.length) return decline(`"${bad[0].words.trim()}" is not something ${t.label}.${bad[0].column.name} (${typeLabel(bad[0].column.type)}) can hold.`);
+      given.forEach((g) => reading.rule(`ival:${g.column.name}`, g.column.name, String(g.words).trim()));
+      const made = [{ id: newId(), kind: "insert_row", table: t.id, values: given.map((g) => ({ column: g.column.name, value: valueFor(g.column, g.words) })) }];
+      ops.push(...made);
+      return done({ reply: { text: stagedReply(made) }, added: [made[0].id] });
+    }
+
+    if (kind.value === "update") {
+      // "set <column> to <value>" is read by rule. Otherwise Jev picks the new value, and an allowed value names its own column.
+      let column = null, value = null;
+      const m = /\b(?:set|change|update|mark)\s+(?:the\s+|every\s+|all\s+|each\s+)?(.+?)\s+(?:to|as|=)\s+("[^"]+"|'[^']+'|“[^”]+”|.+?)(?=\s+(?:on|in|for|where|when|if)\b|$)/i.exec(request);
+      const named = m && settable.find((c) => new RegExp(`^(?:${spoken(c)})(?:\\s+(?:of|on|in)\\b.*)?$`, "i").test(m[1].trim()));
+      if (named && valueFor(named, m[2])) { column = named; value = valueFor(named, m[2]); reading.rule("set", `Set ${column.name} to`, m[2].trim()); }
+      else {
+        const pick = reading.choice("uval", "New value", second.uval, { labels: { ...Object.fromEntries(Object.keys(values).map((k) => [k, k.replace(/^[nes]:/, "")])), [NONE]: "not found" } });
+        if (!pick.ok || pick.value === NONE) return decline(`I couldn't find the new value. Say it like: "set ${settable[0]?.name.replace(/_/g, " ") ?? "a column"} to … on ${t.label}". ${columnList}`);
+        value = pick.value === "now" ? { clock: "now" } : pick.value === "nothing" ? { null: true } : values[pick.value][0];
+        const owner = value.label != null ? settable.filter((c) => draft.enums[c.type.enum]?.values.includes(value.label)) : [];
+        if (owner.length === 1) { column = owner[0]; reading.rule("ucol:label", "Column", `${column.name} (the column that holds "${value.label}")`); }
+        else {
+          const c = reading.choice("ucol", "Column", second.ucol, { labels: { [NONE]: "not found" } });
+          if (!c.ok || c.value === NONE) return decline(`I couldn't tell which column to change. ${columnList}`);
+          column = settable.find((x) => x.name === c.value);
+        }
+        if (value.clock && column.type.base === "date") value = { clock: "today" };
+      }
+      // Whether there is a test at all is said by the wording; which rows it picks is then read like any condition.
+      const scoped = /\b(where|when|whose|if|only|that (are|is|have|has)|which (are|is))\b/i.test(request) || labels.filter((l) => l !== value.label).length > 0;
+      const op2 = { id: newId(), kind: "update_rows", table: t.id, set: { column: column.name, value } };
+      if (scoped) {
+        const others = Object.fromEntries(Object.entries(values).filter(([, [v]]) => JSON.stringify(v) !== JSON.stringify(value)));
+        // The column being set was named as such, so it is not also the column being tested unless it is named again.
+        const testedBy = named ? said.filter((sp, i) => !(sp.ident === column.name && said.findIndex((x) => x.ident === column.name) === i)) : said;
+        // "set every pending order to paid": with paid taken as the new value, pending is the only value left to test for.
+        const left = Object.values(others).map(([v]) => v).filter((v) => v.label != null || v.number != null || v.text != null);
+        const got = readCondition(second, testedBy, others, columnList, { clock: true, bar: INFERRED, onlyValue: left.length === 1 && !testedBy.length ? left[0] : null });
+        if (got.error) return decline(`I found what to set, but not which rows. ${got.error}`);
+        op2.filter = got.condition;
+      }
+      ops.push(op2);
+      return done({ reply: { text: stagedReply([op2]), notes: [`${op2.filter ? "Only the matching rows change." : `Every row of ${t.label} changes: no test was given.`} The old values are not kept. ${warn}`] }, added: [op2.id] });
+    }
+
+    // delete_some: every part of the test must be read with the confidence a deletion deserves.
+    const got = readCondition(second, said, values, columnList, { clock: true, bar: INFERRED });
+    if (got.error) return decline(`To delete some rows I need the test that picks them. ${got.error}`);
+    const made = [{ id: newId(), kind: "delete_rows", table: t.id, filter: got.condition }];
+    ops.push(...made);
+    return done({ reply: { text: stagedReply(made), notes: [`Only the matching rows are deleted; the count is on the right. ${warn}`] }, added: [made[0].id] });
+  }
 
   if (op.value === "create_view") {
     const usable = t.table.columns.filter((c) => c.type.base || c.type.enum).slice(0, 60);

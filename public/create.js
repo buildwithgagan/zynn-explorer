@@ -80,6 +80,8 @@ export function createPage(params, status, { onSchemaChanged, onDatabaseCreated 
         h("div.op-head", h("span.op-label", op.label), level !== "safe" && h(`span.badge${LEVEL_BADGE[level]}`, level),
           h("button.icon-btn", { title: "Remove from draft", "aria-label": `Remove: ${op.label}`, onclick: () => removeOp(op.id) }, "✕")),
         statements.filter((s) => s.reason).map((s) => h("p.op-reason", s.reason)),
+        // Data changes say how many rows they touch, counted against the database as it is now.
+        statements.filter((s) => "affects" in s).map((s) => h("p.op-affects", s.affects == null ? "The number of rows can only be counted once the changes before it are applied." : s.affects === 0 ? "No rows match right now, so this would change nothing." : `${plural(s.affects, "row")} right now.`)),
         op.kind === "create_table" && columnEditor(op),
         decisions && h("div.op-decisions", decisions.items.map((d) =>
           h("label.check.small", { title: d.why }, h("input", { type: "checkbox", checked: d.value, onchange: (e) => patchOp(op.id, (o) => { o.conventions[d.key] = e.target.checked; }) }), d.label))));
@@ -160,7 +162,7 @@ export function createPage(params, status, { onSchemaChanged, onDatabaseCreated 
       const confirmed = draft.confirmPhrase
         ? await confirmDialog({ title: "Apply destructive changes", danger: true, confirmLabel: "Apply", requireText: draft.confirmPhrase,
           body: h("div", h("p", `This migration deletes data from ${draft.database} and cannot be undone:`),
-            h("ul.dialog-list", draft.statements.filter((s) => s.level === "destructive").map((s) => h("li", s.reason))), h("p", `A trial run of all ${plural(n, "statement")} succeeded and was rolled back.`)) })
+            h("ul.dialog-list", draft.statements.filter((s) => s.level === "destructive").map((s) => h("li", s.reason, s.affects != null ? h("strong", ` ${plural(s.affects, "row")} right now.`) : null))), h("p", `A trial run of all ${plural(n, "statement")} succeeded and was rolled back.`)) })
         : await confirmDialog({ title: `Apply to ${draft.database}`, confirmLabel: "Apply", body: `${plural(n, "statement")} will run as one transaction. A trial run succeeded and was rolled back.` });
       if (!confirmed) return;
       applyResult = { pending: "Applying…" }; paintSide();

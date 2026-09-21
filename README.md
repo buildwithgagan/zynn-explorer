@@ -314,6 +314,20 @@ and a zero divisor gives an empty value rather than an error that would block th
 same answer every time, so a condition on today or now ("is overdue", "is expired") is refused with that explanation
 and pointed at Ask instead of being frozen into the table.
 
+**Rows.** Create also changes the data, under the same rules as the structure: a template, never SQL text; staged,
+trial-run, applied in one transaction. "Remove the cancelled orders" and "delete sessions where expires at is before
+now" delete the rows that pass a test; "empty the sessions table" deletes every row of a table, and "delete all the
+sample data" of every table; "set every pending order to paid" and "set seat limit to 10 on plans" change one column;
+"add a product called Explorer with slug explorer" adds one row. Each change shows **how many rows it touches right
+now**, on the change and again in the confirmation, counted read-only against the live data. Anything that deletes or
+overwrites needs the database name typed, and none of it is offered for undo. Emptying a table that others point at is
+refused with their names until you say "and everything that points at it", and the statement then lists every table.
+Because a misread test on a delete removes the wrong rows, the test is read by rule rather than judged: comparison
+words decide it ("over", "at least", "before", "is filled in"), a plain adjective means "is" ("the cancelled orders"),
+"is not" needs a negation in the sentence, an allowed value names its own column, and whatever is still left to Jev
+must reach 0.85 or nothing is staged. "Set <column> to <value>" and "called X … with <column> <value>" are read by rule,
+and a value is checked against the column it goes into.
+
 **Views.** "Create a view of sessions with an is expired flag that is true when expires at is before now", "create a
 view called active subscriptions showing subscriptions where status is active", "a view of overdue invoices: invoices
 where due date is before today". A view is one table's columns plus a yes/no column from a test, or only the rows that
@@ -354,7 +368,7 @@ offered for undo; and an undo previewed before someone changed the schema elsewh
 always read the schema fresh rather than from the one-minute cache, for exactly that last case.
 
 To re-check Jev's readings after changing a question or threshold, connect the app to a scratch database
-with the online-store blueprint applied and run `node scripts/creator-regression.mjs` (67 requests × 3,
+with the online-store blueprint applied and run `node scripts/creator-regression.mjs` (79 requests × 3,
 reports flips). `node scripts/creator-ask.mjs "…"` prints how one request was read. `node scripts/creator-blueprints-live.mjs` dry-runs every blueprint plus sample data.
 
 ## Layout

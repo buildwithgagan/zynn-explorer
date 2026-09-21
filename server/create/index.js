@@ -33,6 +33,12 @@ async function view(rawOps) {
   const baseline = await loadDesign();
   const compiled = compileOps(baseline, cleanOps(rawOps));
   const findings = runAdvisor(compiled.draft, await knownValues());
+  // How many rows each data change touches, counted now, read-only. A change that depends on something still only in the
+  // draft (a column not created yet) cannot be counted until it is applied, and says so.
+  const statements = await Promise.all(compiled.statements.map(async ({ count, ...rest }) => {
+    if (!count) return rest;
+    try { return { ...rest, affects: Number((await db.runSql(count, [], { timeoutMs: 5_000 })).rows[0][0]) }; } catch { return { ...rest, affects: null }; }
+  }));
   return {
     baseline, compiled,
     payload: {
@@ -43,7 +49,7 @@ async function view(rawOps) {
         opId: o.id, table: o.name, items: Object.entries(CONVENTIONS).map(([key, c]) => ({ key, ...c, value: o.conventions[key] })),
       })),
       erd: toErd(baseline, compiled.draft, compiled.renames),
-      statements: compiled.statements, sql: migrationSql(compiled.statements), notes: compiled.notes,
+      statements, sql: migrationSql(compiled.statements), notes: compiled.notes,
       level: compiled.level, confirmPhrase: compiled.confirmPhrase, fingerprint: fingerprint(baseline),
       findings, enums: Object.keys(compiled.draft.enums), roles: Object.keys(compiled.draft.roles), types: Object.keys(TYPES),
       empty: !Object.keys(baseline.tables).length,
@@ -145,7 +151,7 @@ export async function listHistory() {
   return entries.map((e, i) => ({
     id: e.id, at: e.at, summary: e.summary, statements: e.sql?.length ?? 0, sql: (e.sql ?? []).join("\n\n"),
     undoable: Boolean(e.inverseOps) && i === 0 && e.fingerprintAfter === live,
-    reason: !e.inverseOps ? "It deleted data or added an enum value, which cannot be reversed" : i !== 0 ? "Only the latest migration can be undone" : e.fingerprintAfter !== live ? "The database has changed since" : undefined,
+    reason: !e.inverseOps ? "It changed or deleted data, or added an enum value, and that cannot be reversed" : i !== 0 ? "Only the latest migration can be undone" : e.fingerprintAfter !== live ? "The database has changed since" : undefined,
   }));
 }
 
