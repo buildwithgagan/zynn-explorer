@@ -553,3 +553,51 @@ test("sample rows are coherent: time runs forwards, events follow status, number
   }
   for (const l of out["public.order_lines"]) assert.equal(Number(l.line_total), Number((l.quantity * Number(l.unit_price)).toFixed(2)), "a line total is quantity times unit price");
 });
+
+test("rows can be deleted, emptied, updated and added, from templates and checked values only", () => {
+  const base = build([{ kind: "create_enum", name: "sub_status", values: ["trialing", "active", "cancelled"] },
+    table("users", [{ name: "email", type: T("text"), nullable: false }, { name: "nickname", type: T("text") }]),
+    table("sessions", [{ name: "user_id", ref: { table: "public.users", onDelete: "cascade" }, nullable: false }, { name: "expires_at", type: T("timestamptz"), nullable: false }]),
+    table("subscriptions", [{ name: "user_id", ref: { table: "public.users" }, nullable: false }, { name: "status", type: { enum: "public.sub_status" }, nullable: false }, { name: "seats", type: T("integer") }]),
+    table("products", [{ name: "name", type: T("text"), nullable: false }, { name: "slug", type: T("text"), nullable: false }, { name: "is_active", type: T("boolean"), nullable: false, default: { kind: "bool", value: true } }])]).draft;
+  const one = (op) => { const r = build([op], base); assert.deepEqual(r.broken, []); return r; };
+
+  const del = one({ kind: "delete_rows", table: "public.sessions", filter: { column: "expires_at", test: "lt", value: { clock: "now" } } });
+  assert.equal(del.statements[0].sql, 'DELETE FROM "public"."sessions" WHERE "expires_at" < now();');
+  assert.equal(del.statements[0].count, 'SELECT count(*) FROM "public"."sessions" WHERE "expires_at" < now()');
+  assert.equal(del.level, "destructive");
+  assert.equal(del.confirmPhrase, "shop");
+  assert.equal(del.inverse, null, "deleted rows cannot be undone");
+
+  const upd = one({ kind: "update_rows", table: "public.subscriptions", set: { column: "status", value: { label: "active" } }, filter: { column: "status", test: "eq", value: { label: "trialing" } } });
+  assert.equal(upd.statements[0].sql, `UPDATE "public"."subscriptions" SET "status" = 'active'::"public"."sub_status" WHERE "status" = 'trialing'::"public"."sub_status";`);
+  assert.equal(one({ kind: "update_rows", table: "public.users", set: { column: "nickname", value: { null: true } } }).statements[0].sql, 'UPDATE "public"."users" SET "nickname" = NULL;');
+  // Text that is one of an enum's values is accepted for it, however it was capitalised.
+  assert.match(one({ kind: "update_rows", table: "public.subscriptions", set: { column: "status", value: { text: "Cancelled" } } }).statements[0].sql, /SET "status" = 'cancelled'::/);
+
+  const ins = one({ kind: "insert_row", table: "public.products", values: [{ column: "name", value: { text: "O'Reilly Explorer" } }, { column: "slug", value: { text: "explorer" } }] });
+  assert.equal(ins.statements[0].sql, `INSERT INTO "public"."products" ("name", "slug") VALUES ('O''Reilly Explorer', 'explorer');`);
+  assert.equal(ins.level, "safe");
+
+  // Emptying a table that others point at names them, and refuses until they are included.
+  const why = (op) => build([op], base).broken[0]?.reason;
+  assert.match(why({ kind: "truncate_tables", tables: ["public.users"] }), /sessions, subscriptions point at users, so they have to be emptied too/);
+  const empty = one({ kind: "truncate_tables", tables: ["public.users"], withDependents: true });
+  assert.equal(empty.statements[0].sql, 'TRUNCATE TABLE "public"."users", "public"."sessions", "public"."subscriptions" RESTART IDENTITY;');
+  assert.match(empty.statements[0].count, /^SELECT \(SELECT count\(\*\) FROM "public"\."users"\) \+ /);
+  assert.equal(one({ kind: "truncate_tables", tables: ["public.sessions"] }).statements[0].sql, 'TRUNCATE TABLE "public"."sessions" RESTART IDENTITY;');
+
+  assert.match(why({ kind: "delete_rows", table: "public.sessions" }), /needs a test that picks the rows/);
+  assert.match(why({ kind: "insert_row", table: "public.products", values: [{ column: "name", value: { text: "x" } }] }), /also needs slug/);
+  assert.match(why({ kind: "update_rows", table: "public.users", set: { column: "id", value: { number: 1 } } }), /filled in by Postgres/);
+  assert.match(why({ kind: "update_rows", table: "public.users", set: { column: "email", value: { null: true } } }), /is required, so it cannot be emptied/);
+  assert.match(why({ kind: "update_rows", table: "public.subscriptions", set: { column: "seats", value: { text: "many" } } }), /cannot hold text/);
+  assert.match(why({ kind: "update_rows", table: "public.subscriptions", set: { column: "status", value: { label: "paused" } } }), /not one of the values status can hold \(trialing, active, cancelled\)/);
+  // Hostile input: a value is a literal, a column is looked up, a test is a name from a list.
+  assert.match(one({ kind: "update_rows", table: "public.users", set: { column: "nickname", value: { text: "x'; drop table users; --" } } }).statements[0].sql, /SET "nickname" = 'x''; drop table users; --';$/);
+  assert.match(why({ kind: "update_rows", table: "public.users", set: { column: 'nickname" = 1; drop table users; --', value: { text: "x" } } }), /has no column/);
+  assert.match(why({ kind: "delete_rows", table: "public.sessions", filter: { column: "expires_at", test: "lt 1 or true", value: { clock: "now" } } }), /not one Creator can write/);
+  assert.match(why({ kind: "truncate_tables", tables: ['public.users"; drop database x; --'] }), /does not exist/);
+  assert.equal(describeOp(cleanOp({ kind: "update_rows", table: "public.subscriptions", set: { column: "status", value: { label: "active" } }, filter: { column: "status", test: "eq", value: { label: "trialing" } } })), "Set status to active in subscriptions rows where status is trialing");
+  assert.equal(describeOp(cleanOp({ kind: "truncate_tables", tables: ["public.users"], withDependents: true })), "Empty users and everything that points at it");
+});

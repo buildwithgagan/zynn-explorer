@@ -38,6 +38,16 @@ function cleanCondition(raw) {
   };
 }
 
+/** A value to store in a row: a number, text, yes/no, an allowed value, now/today, or empty. Never an expression. */
+function cleanValue(v) {
+  if (v == null || typeof v !== "object") return v == null ? undefined : cleanConstant(v);
+  if (v.null) return { null: true };
+  if (v.clock != null) return { clock: oneOf(v.clock, ["now", "today"], "now") };
+  if (v.label != null) return { label: str(v.label, 63) };
+  if (v.bool != null) return { bool: Boolean(v.bool) };
+  return cleanConstant(v);
+}
+
 const SHAPES = {
   create_schema: (r) => ({ name: str(r.name, 80) }),
   create_table: (r) => ({
@@ -101,6 +111,11 @@ const SHAPES = {
     column: str(r.column), command: oneOf(r.command, Object.keys(POLICY_COMMANDS), "all"), role: str(r.role), setting: str(r.setting, 80),
   }),
   drop_policy: (r) => ({ table: str(r.table), name: str(r.name) }),
+  // Changes to the rows themselves. Each is a template over real columns, like everything else here.
+  delete_rows: (r) => ({ table: str(r.table), filter: cleanCondition(r.filter) }),
+  truncate_tables: (r) => ({ tables: strList(r.tables, 80), withDependents: bool(r.withDependents, false), restartIdentity: bool(r.restartIdentity, true) }),
+  update_rows: (r) => ({ table: str(r.table), set: { column: str(r.set?.column), value: cleanValue(r.set?.value) }, filter: cleanCondition(r.filter) }),
+  insert_row: (r) => ({ table: str(r.table), values: (Array.isArray(r.values) ? r.values : []).slice(0, 40).map((x) => ({ column: str(x?.column), value: cleanValue(x?.value) })) }),
   seed: (r) => ({
     tables: strList(r.tables, 60), rows: Math.min(1000, Math.max(1, Math.trunc(Number(r.rows)) || 25)),
     seedValue: (Math.trunc(Number(r.seedValue)) || 1) >>> 0,

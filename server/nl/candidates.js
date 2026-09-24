@@ -295,7 +295,7 @@ export function valueLists(request) {
 // Several changes in one message. Where one change ends and the next begins is a matter of punctuation and
 // command verbs, so code finds it. Each piece is then read on its own, in order.
 // ---------------------------------------------------------------------------
-const COMMAND = "make|rename|drop|remove|delete|add|change|create|index|set|let|give|grant|revoke|fill|seed|turn|build|design|allow|stop|link|connect|call|convert|default|export|review";
+const COMMAND = "make|rename|drop|remove|delete|add|change|create|index|set|let|give|grant|revoke|fill|seed|turn|build|design|allow|stop|link|connect|call|convert|default|export|review|empty|clear|wipe|insert|update|mark";
 const COMMAND_START = new RegExp(`^(?:please\\s+|also\\s+|then\\s+|and\\s+|now\\s+|next\\s+|finally\\s+|lastly\\s+)*(?:${COMMAND})\\b`, "i");
 // A request that creates or adds something goes on to describe it: its fields, what it belongs to, what happens on delete.
 const DESCRIBES = /^(?:please\s+|also\s+|then\s+|and\s+|now\s+)*(?:create|add|build|design)\b/i;

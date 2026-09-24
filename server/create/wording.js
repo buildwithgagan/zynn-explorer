@@ -21,6 +21,9 @@ function columnPhrase(c) {
 const describeCalculated = (op, t) => (GENERATED[op.template]?.arity === 1 ? `Add ${op.name} to ${t}, always the ${GENERATED[op.template].symbol} ${op.columns[0]}`
   : `Add ${op.name} to ${t}, always ${op.columns[0]} ${GENERATED[op.template]?.symbol ?? "?"} ${op.columns[1]}`);
 
+const valueWords = (v) => (!v ? "?" : v.null ? "empty" : v.clock ?? v.label?.replace(/_/g, " ") ?? (v.bool != null ? (v.bool ? "yes" : "no") : v.text != null ? `"${v.text}"` : String(v.number)));
+const whenWords = (c) => (!c ? "?" : `${c.column} ${TESTS[c.test]?.words ?? "?"}${c.value ? ` ${c.value.column ?? valueWords(c.value)}` : ""}`);
+
 /** One line describing an op, for the Changes list and for history. */
 export function describeOp(op) {
   const t = tableName(op.table);
@@ -79,6 +82,10 @@ export function describeOp(op) {
       : op.template === "owner_column" ? `Limit ${t} to rows where ${op.column} is the current user`
       : `Limit ${t} to rows of the current tenant (${op.column})`;
     case "drop_policy": return `Drop policy ${op.name} on ${t}`;
+    case "delete_rows": return `Delete ${t} rows where ${whenWords(op.filter)}`;
+    case "truncate_tables": return `Empty ${list(op.tables.map(tableName))}${op.withDependents ? " and everything that points at " + (op.tables.length === 1 ? "it" : "them") : ""}`;
+    case "update_rows": return `Set ${op.set.column} to ${valueWords(op.set.value)} in ${op.filter ? `${t} rows where ${whenWords(op.filter)}` : `every row of ${t}`}`;
+    case "insert_row": return `Add a row to ${t}: ${op.values.map((x) => `${x.column} = ${valueWords(x.value)}`).join(", ")}`;
     case "seed": return `Add ${plural(op.rows, "sample row")} to ${op.tables.length ? list(op.tables.map(tableName)) : "every table"}`;
     default: return op.kind;
   }

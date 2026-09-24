@@ -71,6 +71,19 @@ const CASES = [
   ["create a view of expired orders: orders where placed at has expired", /^create_view:expired_orders\{placed_at lt now\}$/],
   ["create a view called big items showing order items where quantity is over 100", /^create_view:big_items\{quantity gt 100\}$/],
   ["drop the paid orders view", /^$/, [{ id: "v", kind: "create_view", name: "paid_orders", table: "public.orders", flags: [], filter: { column: "status", test: "eq", value: { label: "paid" } } }]],
+  // Rows: delete, empty, update, add. None of these may be confused with dropping a table or seeding.
+  ["empty the reviews table", /^truncate_tables:reviews$/],
+  ["empty the customers table", null], // orders, addresses and reviews point at it: refused with the reason
+  ["empty the customers table and everything that points at it", /^truncate_tables:customers\+$/],
+  ["delete all the sample data", /^truncate_tables:\*\+$/],
+  ["remove the cancelled orders", /^delete_rows:orders\{status eq cancelled\}$/],
+  ["delete the orders that are not cancelled", /^delete_rows:orders\{status neq cancelled\}$/],
+  ["delete the inactive products", /^(delete_rows:products\{is_active eq false\})?$/], // may decline; must never read as active
+  ["delete orders where placed at is before now", /^delete_rows:orders\{placed_at lt now\}$/],
+  ["set every pending order to paid", /^update_rows:orders\.status=paid\{status eq pending\}$/],
+  ["set the price to 10 on products", /^update_rows:products\.price=10$/],
+  ["set price to 5 on products where is active is false", /^update_rows:products\.price=5\{is_active eq false\}$/],
+  ["add a category called Gadgets with slug gadgets", /^insert_row:categories\[name=Gadgets,slug=gadgets\]$/],
   // Several changes in one message.
   ["make the sku on products optional, rename categories to collections and index orders by placed at", /^drop_not_null:products\.sku rename_table:categories>collections add_index:orders\(placed_at\)$/],
   ["add a nickname to customers and make it required", /^add_column:customers\.nickname!$/],
@@ -101,6 +114,13 @@ const sig = (o) => {
       if (o.template === "when") return `add_generated_column:${t(o.table)}.${o.name}=when(${o.condition.column} ${o.condition.test}${o.condition.value ? " " + v(o.condition.value) : ""})${o.then ? `?${v(o.then)}:${v(o.else) ?? ""}` : ""}`;
       return `add_generated_column:${t(o.table)}.${o.name}=${o.template}(${o.columns})${o.constant ? `*${v(o.constant)}${o.constantFirst ? " first" : ""}` : ""}`;
     }
+    case "truncate_tables": return `truncate_tables:${o.tables.length > 3 ? "*" : o.tables.map(t)}${o.withDependents ? "+" : ""}`;
+    case "delete_rows": case "update_rows": {
+      const val = (x) => x?.clock ?? x?.column ?? x?.label ?? x?.text ?? (x?.bool != null ? String(x.bool) : x?.null ? "null" : x?.number);
+      const cond = o.filter ? `{${o.filter.column} ${o.filter.test}${o.filter.value ? " " + val(o.filter.value) : ""}}` : "";
+      return o.kind === "delete_rows" ? `delete_rows:${t(o.table)}${cond}` : `update_rows:${t(o.table)}.${o.set.column}=${val(o.set.value)}${cond}`;
+    }
+    case "insert_row": return `insert_row:${t(o.table)}[${o.values.map((x) => `${x.column}=${x.value.text ?? x.value.number ?? x.value.label ?? x.value.bool}`)}]`;
     case "create_view": {
       const c = (k) => `${k.column} ${k.test}${k.value ? " " + (k.value.clock ?? k.value.column ?? k.value.label ?? k.value.text ?? (k.value.bool != null ? String(k.value.bool) : k.value.number)) : ""}`;
       return `create_view:${o.name}${o.flags.length ? `[${o.flags.map((f) => `${f.name}:${c(f.condition)}`)}]` : ""}${o.filter ? `{${c(o.filter)}}` : ""}`;
@@ -133,7 +153,7 @@ for (const [request, expect, preset] of CASES) {
   }
   const stable = seen.size === 1;
   const [first] = seen.keys();
-  const right = expect ? expect.test(first) : first === "(nothing staged)";
+  const right = expect ? expect.test(first === "(nothing staged)" ? "" : first) : first === "(nothing staged)";
   if (!stable || !right) bad++;
   console.log(`${stable && right ? "ok  " : !stable ? "FLIP" : "WRONG"} ${request}\n       ${[...seen].map(([k, n]) => `${n}× ${k}`).join("\n       ")}${weakest < 0.7 ? `\n       weakest applied judgment ${weakest.toFixed(2)}` : ""}`);
 }
