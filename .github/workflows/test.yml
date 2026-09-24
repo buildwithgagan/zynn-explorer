@@ -1,0 +1,37 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [20, 22]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - run: npm ci
+      # The browser modules have no tests of their own, so at least make sure they parse.
+      - name: Syntax-check every module
+        run: |
+          for f in server/*.js server/*/*.js server/*/*/*.js public/*.js scripts/*.mjs; do
+            node --check "$f" || exit 1
+          done
+      # No database and no TYPESAFE_API_KEY are needed: these tests cover the deterministic code around Jev,
+      # including every SQL-injection case. The Jev regression (scripts/creator-regression.mjs) needs both and runs locally.
+      - run: npm test
